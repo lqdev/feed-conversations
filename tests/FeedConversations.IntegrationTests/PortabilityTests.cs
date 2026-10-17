@@ -5,6 +5,8 @@ using System.Text;
 using System.Text.Json;
 using System.Xml.Linq;
 using FeedConversations.Api.Data;
+using FeedConversations.Api.Portability;
+using FeedConversations.Api.Syndication;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -12,6 +14,85 @@ namespace FeedConversations.IntegrationTests;
 
 public sealed class PortabilityTests
 {
+    [Fact]
+    public async Task TwentyThousandOwnedPostsCommitAndReimportWithoutTruncation()
+    {
+        await using var destination = new ApiFixture("b", new FakeRemote());
+        var (carol, _, _) = await destination.LoginAsync("carol");
+        using (carol)
+        {
+            var date = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            var posts = Enumerable.Range(0, 20000).Select(i =>
+            {
+                var url = $"https://a.example/post/{new Guid(i, 0, 0, new byte[8])}";
+                return new ArchivePost(url, url, date, date, 1, "post", null, "Owned synthetic text.", null, null, null);
+            }).ToList();
+            var archive = new AccountArchive(new(1, "synthetic-export", "synthetic-instance", "alice",
+                "https://a.example", "local-sequence:0", posts.Count, []), new("Alice", "", false), posts, [], []);
+            var bytes = new ArchiveCodec(new OpmlCodec()).Write(archive);
+            await destination.ConfirmAsync(carol, "carol");
+            var commit = await Upload(carol, bytes, "commit", ArchiveCodec.Hash(bytes));
+            Assert.True(commit.IsSuccessStatusCode, await commit.Content.ReadAsStringAsync());
+            var repeat = await Upload(carol, bytes, "commit", ArchiveCodec.Hash(bytes));
+            Assert.True(repeat.IsSuccessStatusCode, await repeat.Content.ReadAsStringAsync());
+            Assert.True((await repeat.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("alreadyImported").GetBoolean());
+            using var scope = destination.Services.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            Assert.Equal(20000, await db.Posts.CountAsync());
+            Assert.Single(await db.ImportRuns.ToListAsync());
+            Assert.Empty(await db.Jobs.ToListAsync());
+        }
+    }
+
+    [Fact]
+    public async Task LaterArchiveUpdatesAndThenWithdrawsMappedPublicationWithoutChangingIdentity()
+    {
+        await using var source = new ApiFixture(remote: new FakeRemote());
+        await using var destination = new ApiFixture("b", new FakeRemote());
+        var (alice, _, _) = await source.LoginAsync();
+        var (carol, _, _) = await destination.LoginAsync("carol");
+        using (alice) using (carol)
+        {
+            var original = await Create(alice, "post", null, "First owned state.");
+            var sourceId = original.GetProperty("id").GetString()!;
+            await source.ConfirmAsync(alice, "alice");
+            await destination.ConfirmAsync(carol, "carol");
+            async Task Import()
+            {
+                var bytes = await alice.GetByteArrayAsync("/api/v1/export");
+                var response = await Upload(carol, bytes, "commit", ArchiveCodec.Hash(bytes));
+                Assert.True(response.IsSuccessStatusCode, await response.Content.ReadAsStringAsync());
+            }
+            await Import();
+            var before = await alice.GetAsync($"/api/v1/posts/{sourceId}");
+            using var edit = new HttpRequestMessage(HttpMethod.Patch, $"/api/v1/posts/{sourceId}")
+                { Content = JsonContent.Create(new { markdown = "Updated owned state." }) };
+            edit.Headers.TryAddWithoutValidation("If-Match", before.Headers.ETag!.Tag);
+            Assert.True((await alice.SendAsync(edit)).IsSuccessStatusCode);
+            await Import();
+            Guid destinationId;
+            using (var scope = destination.Services.CreateScope())
+            {
+                var restored = await scope.ServiceProvider.GetRequiredService<AppDbContext>().Posts.SingleAsync();
+                destinationId = restored.Id;
+                Assert.Equal("Updated owned state.", restored.Markdown);
+                Assert.Contains("Updated owned state.", restored.Html);
+                Assert.Equal(original.GetProperty("guid").GetString(), restored.Guid);
+            }
+            var current = await alice.GetAsync($"/api/v1/posts/{sourceId}");
+            using var delete = new HttpRequestMessage(HttpMethod.Delete, $"/api/v1/posts/{sourceId}");
+            delete.Headers.TryAddWithoutValidation("If-Match", current.Headers.ETag!.Tag);
+            Assert.Equal(HttpStatusCode.NoContent, (await alice.SendAsync(delete)).StatusCode);
+            await Import();
+            using var verify = destination.Services.CreateScope();
+            var post = await verify.ServiceProvider.GetRequiredService<AppDbContext>().Posts.SingleAsync();
+            Assert.Equal(destinationId, post.Id);
+            Assert.NotNull(post.DeletedAt);
+            Assert.Null(post.Markdown);
+            Assert.Null(post.Html);
+        }
+    }
+
     private static async Task<JsonElement> Create(HttpClient client, string kind, string? target, string? body)
     {
         using var request = new HttpRequestMessage(HttpMethod.Post, "/api/v1/posts") { Content = JsonContent.Create(new
@@ -52,6 +133,10 @@ public sealed class PortabilityTests
             delete.Headers.TryAddWithoutValidation("If-Match", beforeDelete.Headers.ETag!.Tag);
             Assert.Equal(HttpStatusCode.NoContent, (await alice.SendAsync(delete)).StatusCode);
             await alice.PostAsJsonAsync("/api/v1/subscriptions", new { url = "https://controlled.example/rss", label = "Synthetic", group = "Group" });
+            Assert.Equal(HttpStatusCode.Created, (await alice.PostAsJsonAsync("/api/v1/views", new {
+                version = 1, name = "All kinds", includeLocal = true, sourceFeedUrls = new[] { "https://controlled.example/rss" },
+                textContains = (string?)null, textExcludes = (string?)null, sort = "published-desc",
+                entryKinds = new[] { "post", "reply", "like", "bookmark" } })).StatusCode);
             await source.ConfirmAsync(alice, "alice");
             var bytes = await alice.GetByteArrayAsync("/api/v1/export");
             using (var memory = new MemoryStream(bytes))
@@ -87,6 +172,7 @@ public sealed class PortabilityTests
             Assert.Equal("false", (string?)Assert.Single(rss.Descendants("guid")).Attribute("isPermaLink"));
             Assert.Equal(rootUrl, Assert.Single(rss.Descendants("guid")).Value);
             Assert.Single(await db.Subscriptions.ToListAsync());
+            Assert.Single(await db.Views.ToListAsync());
             Assert.Single(await db.References.ToListAsync());
         }
     }

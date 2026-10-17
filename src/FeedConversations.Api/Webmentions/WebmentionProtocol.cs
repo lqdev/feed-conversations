@@ -12,6 +12,27 @@ public sealed record SourceEvidence(bool Backlink, string Status, string Kind, s
 
 public sealed partial class WebmentionProtocol
 {
+    public SourceEvidence CompareFeed(SourceEvidence evidence, RemoteDocument feed, string source, string target, FeedReader reader)
+    {
+        if (feed.Status != 200) return evidence;
+        if (feed.FinalUrl.GetLeftPart(UriPartial.Authority) != new Uri(source).GetLeftPart(UriPartial.Authority))
+            return evidence with { Status = "ambiguous", Kind = "mention", Entry = null };
+        var matching = reader.Parse(feed.Bytes, feed.FinalUrl).Where(e => UrlPolicy.Key(e.Permalink) == UrlPolicy.Key(source)).ToList();
+        if (matching.Count > 1) return evidence with { Status = "ambiguous", Kind = "mention", Entry = null };
+        if (matching.Count == 0) return evidence;
+        var item = matching[0];
+        var disagrees = item.SemanticStatus == "ambiguous"
+            || item.TargetUrl is not null && UrlPolicy.Key(item.TargetUrl) != UrlPolicy.Key(target)
+            || evidence.Status == "supported" && item.SemanticStatus == "supported" && evidence.Kind != item.Kind
+            || evidence.AuthorUrl is not null && item.AuthorUrl is not null && UrlPolicy.Key(evidence.AuthorUrl) != UrlPolicy.Key(item.AuthorUrl);
+        if (disagrees) return evidence with { Status = "ambiguous", Kind = "mention", Entry = null };
+        if (!item.OriginAuthority || item.SemanticStatus == "incomplete" || evidence.Status == "incomplete")
+            return evidence with { Status = "incomplete", Kind = "mention", Entry = null };
+        if (item.SemanticStatus == "supported" && item.Kind is "reply" or "like" or "bookmark" && item.TargetUrl is not null)
+            return evidence with { Status = "supported", Kind = item.Kind, Entry = item,
+                AuthorUrl = item.AuthorUrl, AuthorFeedUrl = item.AuthorFeedUrl ?? evidence.AuthorFeedUrl, CommentsUrl = item.CommentsUrl };
+        return evidence;
+    }
     public string? Discover(RemoteDocument document)
     {
         foreach (var header in document.LinkHeaders)

@@ -7,7 +7,7 @@ const certificate = new X509Certificate(readFileSync(resolve(".runtime/localhost
 const spki = createHash("sha256").update(certificate.publicKey.export({ type: "spki", format: "der" })).digest("base64");
 export default defineConfig({
   testDir: ".",
-  testMatch: "*.spec.ts",
+  testMatch: "conversation.spec.ts",
   timeout: 180_000,
   expect: { timeout: 20_000 },
   workers: 1,

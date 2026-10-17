@@ -82,6 +82,7 @@ public sealed class ThreadTests
                 root ??= post.Permalink;
                 previous = post;
             }
+
             await db.SaveChangesAsync();
             var result = await scope.ServiceProvider.GetRequiredService<ThreadAssembler>().Assemble(root!, true, default);
             Assert.Equal(17, result.Nodes.Count);
@@ -98,7 +99,7 @@ public sealed class ThreadTests
         {
             var parent = name == "first" ? "second" : "first";
             var url = $"https://controlled.example/{name}";
-            Add(url, "text/html", $"<link rel='alternate' type='application/rss+xml' href='{url}.xml'>");
+            Add(url, "text/html", $"<link rel='alternate' type='application/rss+xml' href='{url}.xml'><a href='https://controlled.example/{parent}'>Parent</a>");
             Add(url + ".xml", "application/rss+xml", "<rss xmlns:a='http://www.w3.org/2005/Atom'><channel><item>"
                 + $"<guid isPermaLink='false'>opaque:{name}</guid><link>{url}</link><a:category term='https://schema.org/Comment'/>"
                 + $"<a:link rel='https://schema.org/author' href='/author'/><a:link rel='https://schema.org/parentItem' href='https://controlled.example/{parent}'/>"
@@ -116,5 +117,78 @@ public sealed class ThreadTests
         }
         void Add(string url, string type, string body) => remote.Documents[url] = new RemoteDocument(new Uri(url), 200, type,
             Encoding.UTF8.GetBytes(body), [], DateTime.UtcNow, DateTime.UtcNow, true, null);
+    }
+
+    [Theory]
+    [InlineData(199)]
+    [InlineData(200)]
+    [InlineData(201)]
+    public async Task SharedNodeLimitIncludesRootAndReportsOverflow(int count)
+    {
+        await using var fixture = new ApiFixture(remote: new FakeRemote());
+        var (client, _, owner) = await fixture.LoginAsync();
+        using (client) using (var scope = fixture.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var root = Publication(owner); root.Permalink = "https://a.example/post/" + root.Id;
+            db.Posts.Add(root);
+            for (var i = 1; i < count; i++)
+            {
+                var child = Publication(owner, "reply", root.Permalink);
+                child.Permalink = "https://a.example/post/" + child.Id;
+                db.Posts.Add(child);
+                db.References.Add(new InteractionReference { TargetId = root.Id, SourceUrl = child.Permalink,
+                    SourceKey = UrlPolicy.Key(child.Permalink), LocalSourceId = child.Id, Kind = "reply", Status = "visible" });
+            }
+            await db.SaveChangesAsync();
+            var result = await scope.ServiceProvider.GetRequiredService<ThreadAssembler>().Assemble(root.Permalink, true, default);
+            Assert.Equal(Math.Min(count, 200), result.Nodes.Count);
+            Assert.Equal(count <= 200, result.Complete);
+            if (count > 200) Assert.Contains("node-budget", result.PartialReasons);
+        }
+    }
+
+    [Theory]
+    [InlineData(9)]
+    [InlineData(10)]
+    [InlineData(11)]
+    public async Task FetchBudgetIsSharedAcrossEveryParentHtmlAndFeed(int count)
+    {
+        var remote = new FakeRemote();
+        for (var i = 0; i < count; i++)
+        {
+            var url = $"https://controlled.example/node-{i}";
+            var parent = i + 1 < count ? $"https://controlled.example/node-{i + 1}" : null;
+            Add(url, "text/html", $"<link rel='alternate' type='application/rss+xml' href='{url}.xml'>"
+                + (parent is null ? "" : $"<a href='{parent}'>Parent</a>"));
+            Add(url + ".xml", "application/rss+xml", "<rss xmlns:a='http://www.w3.org/2005/Atom'><channel><item>"
+                + $"<guid>{url}</guid><link>{url}</link><a:category term='https://schema.org/{(parent is null ? "SocialMediaPosting" : "Comment")}'/>"
+                + "<a:link rel='https://schema.org/author' href='/author'/>"
+                + (parent is null ? "" : $"<a:link rel='https://schema.org/parentItem' href='{parent}'/>")
+                + "<description>Transient synthetic body.</description></item></channel></rss>");
+        }
+        await using var fixture = new ApiFixture(remote: remote);
+        using var scope = fixture.Services.CreateScope();
+        var result = await scope.ServiceProvider.GetRequiredService<ThreadAssembler>().Assemble("https://controlled.example/node-0", true, default);
+        Assert.Equal(Math.Min(count * 2, 20), remote.Reads.Count);
+        Assert.Equal(count <= 10, result.Complete);
+        if (count > 10) Assert.Contains("fetch-budget", result.PartialReasons);
+        void Add(string url, string type, string body) => remote.Documents[url] = new RemoteDocument(new Uri(url), 200, type,
+            Encoding.UTF8.GetBytes(body), [], DateTime.UtcNow, DateTime.UtcNow, true, null);
+    }
+
+    [Theory]
+    [InlineData(410, "tombstone")]
+    [InlineData(503, "unavailable")]
+    public async Task ForeignDeletionProofIsDistinctFromTransientOutage(int status, string availability)
+    {
+        const string url = "https://controlled.example/missing";
+        var remote = new FakeRemote();
+        remote.Documents[url] = new RemoteDocument(new Uri(url), status, "text/html", [], [], DateTime.UtcNow, DateTime.UtcNow, true, null);
+        await using var fixture = new ApiFixture(remote: remote);
+        using var scope = fixture.Services.CreateScope();
+        var result = await scope.ServiceProvider.GetRequiredService<ThreadAssembler>().Assemble(url, true, default);
+        Assert.Equal(availability, Assert.Single(result.Nodes).Availability);
+        Assert.False(result.Complete);
     }
 }

@@ -1763,9 +1763,9 @@ export interface components {
             directoryUrl: null | string;
         };
         CreatePost: {
-            title: null | string;
-            markdown: null | string;
-            relationship: null | components["schemas"]["Relationship"];
+            title?: null | string;
+            markdown?: null | string;
+            relationship?: null | components["schemas"]["Relationship"];
         };
         JsonElement: unknown;
         LoginRequest: {
@@ -1781,18 +1781,18 @@ export interface components {
         };
         PasswordRequest: {
             password: string;
-            newPassword: null | string;
+            newPassword?: null | string;
         };
         ProfilePatch: {
-            displayName: null | string;
-            bio: null | string;
-            directoryVisible: null | boolean;
+            displayName?: null | string;
+            bio?: null | string;
+            directoryVisible?: null | boolean;
         };
         RedeemRequest: {
             code: string;
             handle: string;
             password: string;
-            displayName: null | string;
+            displayName?: null | string;
         };
         Relationship: {
             kind: string;
@@ -1810,7 +1810,7 @@ export interface components {
         SubscriptionCommand: {
             url: string;
             label: string;
-            group: null | string;
+            group?: null | string;
         };
         TargetIdentity: {
             kind: string;

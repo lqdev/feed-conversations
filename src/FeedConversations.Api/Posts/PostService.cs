@@ -167,6 +167,28 @@ public sealed class PostService(AppDbContext db, InstanceOptions options, IRemot
         if (await db.Jobs.CountAsync(j => j.State != "accepted" && j.State != "unsupported" && j.State != "failed", ct) >= ResourceLimits.Jobs)
             throw new ApiProblem(503, "job-capacity", "Notification capacity is exhausted.");
     }
+    public async Task ReverifyAsync(InteractionReference reference, CancellationToken ct)
+    {
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        var target = reference.TargetUrl ?? $"{options.BaseUrl}/post/{reference.TargetId}";
+        var job = await db.Jobs.SingleOrDefaultAsync(j => j.Direction == "in" && j.SourceUrl == reference.SourceUrl && j.TargetUrl == target, ct);
+        if (job is not null && job.State is not ("accepted" or "unsupported" or "failed")) return;
+        await CheckJobCapacity(ct);
+        if (job is null)
+        {
+            job = new MentionJob { Direction = "in", SourceUrl = reference.SourceUrl, TargetUrl = target, TargetId = reference.TargetId };
+            db.Jobs.Add(job);
+        }
+        job.SourceRevision++;
+        job.State = "pending";
+        job.Attempt = 0;
+        job.LeaseToken = null;
+        job.LeaseUntil = null;
+        job.Error = null;
+        job.DueAt = job.UpdatedAt = clock.GetUtcNow().UtcDateTime;
+        await db.SaveChangesAsync(ct);
+        await tx.CommitAsync(ct);
+    }
     public async Task CheckReferenceCapacity(Guid target, CancellationToken ct)
     {
         if (await db.References.CountAsync(ct) >= ResourceLimits.References

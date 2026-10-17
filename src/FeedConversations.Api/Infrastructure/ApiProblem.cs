@@ -25,17 +25,15 @@ public sealed class ProblemHandler(IProblemDetailsService problems, ILogger<Prob
                 exception.GetType().Name, context.TraceIdentifier);
         context.Response.StatusCode = status;
         if (status is 429 or 503) context.Response.Headers.RetryAfter = "30";
-        await problems.WriteAsync(new ProblemDetailsContext
+        var details = new ProblemDetails
         {
-            HttpContext = context,
-            ProblemDetails = new ProblemDetails
-            {
-                Status = status,
-                Title = known?.Message ?? "An internal operation failed.",
-                Type = $"urn:feed-conversations:problem:{known?.Code ?? "internal-error"}",
-                Extensions = { ["code"] = known?.Code ?? "internal-error", ["traceId"] = context.TraceIdentifier }
-            }
-        });
+            Status = status,
+            Title = known?.Message ?? "An internal operation failed.",
+            Type = $"urn:feed-conversations:problem:{known?.Code ?? "internal-error"}",
+            Extensions = { ["code"] = known?.Code ?? "internal-error", ["traceId"] = context.TraceIdentifier }
+        };
+        if (!await problems.TryWriteAsync(new ProblemDetailsContext { HttpContext = context, ProblemDetails = details }))
+            await context.Response.WriteAsJsonAsync(details, Wire.Json, "application/problem+json", token);
         return true;
     }
 }

@@ -8,6 +8,7 @@ public static partial class UrlPolicy
 {
     public static Uri Parse(string text)
     {
+        if (string.IsNullOrWhiteSpace(text)) throw ApiProblem.Invalid("invalid-url");
         text = text.Trim();
         if (text.Length > 4096 || text.Any(c => char.IsControl(c) || char.IsWhiteSpace(c) || c == '\\')
             || BadEscape().IsMatch(text) || !Uri.TryCreate(text, UriKind.Absolute, out var uri)

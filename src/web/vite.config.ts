@@ -1,10 +1,18 @@
 import { defineConfig } from "vitest/config";
 import { readFileSync } from "node:fs";
+import type { ProxyOptions } from "vite";
 
-const proxy = (target: string, prefix: string) => ({
+const proxy = (target: string, prefix: string): ProxyOptions => ({
   target,
   changeOrigin: false,
   rewrite: (path: string) => path.replace(prefix, ""),
+  configure: proxyServer => {
+    proxyServer.on("proxyReq", (upstream, _request, response) => {
+      response.once("close", () => {
+        if (!response.writableEnded) upstream.destroy();
+      });
+    });
+  },
 });
 export default defineConfig({
   server: {

@@ -2,9 +2,9 @@
 
 A multi-user, feeds-native publishing and conversation application.
 
-**Status: MVP implementation in progress; not release-ready.** The real two-instance
-publishing/reading/Webmention loop runs. The complete acceptance matrix and
-operational/recovery gates in the implementation plan are not yet satisfied.
+**Status: implemented MVP with controlled end-to-end acceptance.** Two independent
+instances run four-user conversations, edits, withdrawals, transient reading and
+recovery. No public application has been deployed.
 
 The application uses .NET 10 ASP.NET Core Minimal APIs, SQLite, an independent
 TypeScript/RxJS browser client, and Aspire for local two-instance development.
@@ -13,7 +13,8 @@ feeds without permanently archiving other publishers' content.
 
 See [the implementation plan](docs/implementation-plan.md) for the complete
 requirements, wire contracts, delivery milestones, limits, and acceptance cases.
-Passing a build or the first conversation loop is not full-MVP completion.
+See [acceptance evidence](docs/acceptance-demo.md) for the A01-A36 mapping,
+executed checks and interoperability limits.
 
 ## Local development
 
@@ -25,6 +26,7 @@ dotnet tool restore
 dotnet restore FeedConversations.slnx --locked-mode
 dotnet build FeedConversations.slnx -c Release --no-restore
 npm ci
+npm exec playwright install chromium
 .\scripts\Initialize-Dev.ps1
 .\scripts\Start-Demo.ps1
 ```
@@ -38,27 +40,24 @@ public key; safe A/B transport trusts only that certificate at exact configured
 Development origins. Production refuses these exceptions.
 
 ```powershell
-dotnet test tests\FeedConversations.UnitTests -c Release --no-build
-dotnet test tests\FeedConversations.IntegrationTests -c Release --no-build
-npm run typecheck --workspace @feed-conversations/web
-npm run test --workspace @feed-conversations/web -- --run
-npm run build --workspace @feed-conversations/web
-npm exec playwright install chromium
-# With the process demo running:
-npm run test:browser
-dotnet test tests\FeedConversations.AcceptanceTests -c Release --no-build
+# With no demo already running:
+.\scripts\Test-All.ps1
+# Also exercise non-root containers, independent static hosting and older restore:
+.\scripts\Test-All.ps1 -Standalone
 ```
 
-Current executed evidence: 44 unit checks, 25 integration checks, 9 frontend
-checks, 2 real-browser checks, and a separate .NET public RSS-only walker pass.
-These cover four-user A/B conversations, reverse-direction delivery, pinned
-retrieval/cache limits, protocol conflicts, durable SSE rechecks/revocation,
-restore conflicts, and empty browser storage. The independent walker consumes
-the synthetic chain produced by browser acceptance; run them in the shown order.
-This is partial acceptance evidence, not a claim that A01-A36 all pass.
+Executed evidence: 72 unit checks, 73 integration checks, 13 frontend checks,
+4 real-browser scenarios and 2 independent .NET acceptance checks. The separate
+standalone scenario passes before and after an actual older-backup restore.
+Release builds have zero warnings/errors; TypeScript checks include the client,
+proxy configuration and browser tests. The runner orders the public RSS walker
+after the browser creates its synthetic A/B chain and stops its owned helpers.
 
 See [protocol details](docs/protocol.md) for the application-specific profile and
 the restored-copy authority boundary.
+See [architecture](docs/architecture.md), [operations](docs/operations.md),
+[account portability](docs/portability.md) and
+[compatibility](docs/compatibility.md) for deployment and authority boundaries.
 
 ## Boundaries
 

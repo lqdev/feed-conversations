@@ -79,6 +79,7 @@ builder.Services.ConfigureHttpJsonOptions(options =>
 {
     options.SerializerOptions.UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow;
     options.SerializerOptions.RespectNullableAnnotations = true;
+    options.SerializerOptions.RespectRequiredConstructorParameters = true;
 });
 builder.Services.AddProblemDetails();
 builder.Services.AddExceptionHandler<ProblemHandler>();
@@ -90,6 +91,7 @@ builder.Services.AddSingleton<IRemoteConnector, SocketRemoteConnector>();
 builder.Services.AddSingleton<FeedReader>();
 builder.Services.AddSingleton<ChangeJournal>();
 builder.Services.AddScoped<PostService>();
+builder.Services.AddScoped<CreateReceipts>();
 builder.Services.AddSingleton<RssWriter>();
 builder.Services.AddSingleton<WebmentionProtocol>();
 builder.Services.AddHostedService<MentionWorker>();

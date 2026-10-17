@@ -10,9 +10,9 @@ using Microsoft.EntityFrameworkCore;
 namespace FeedConversations.Api.Accounts;
 
 public sealed record LoginRequest(string Handle, string Password);
-public sealed record RedeemRequest(string Code, string Handle, string Password, string? DisplayName);
-public sealed record PasswordRequest(string Password, string? NewPassword);
-public sealed record ProfilePatch(string? DisplayName, string? Bio, bool? DirectoryVisible);
+public sealed record RedeemRequest(string Code, string Handle, string Password, string? DisplayName = null);
+public sealed record PasswordRequest(string Password, string? NewPassword = null);
+public sealed record ProfilePatch(string? DisplayName = null, string? Bio = null, bool? DirectoryVisible = null);
 
 public static partial class AccountEndpoints
 {
@@ -60,19 +60,34 @@ public static partial class AccountEndpoints
             return Results.NoContent();
         }).RequireAuthorization();
         api.MapPost("/auth/redeem-invite", async (RedeemRequest request, AppDbContext db,
-            UserManager<Account> users, SignInManager<Account> signin, TimeProvider clock, CancellationToken ct) =>
+            UserManager<Account> users, SignInManager<Account> signin, TimeProvider clock, HttpContext ctx, CreateReceipts receipts, CancellationToken ct) =>
         {
-            if (!Handle().IsMatch(request.Handle) || request.Code.Length > 200) throw ApiProblem.Invalid("invalid-handle-or-code");
+            if (!Handle().IsMatch(request.Handle) || request.Code.Length > 200 || request.Password.Length > 1024 || request.DisplayName is { Length: > 200 })
+                throw ApiProblem.Invalid("invalid-handle-or-code");
             Syndication.SemanticProfile.ValidateText(request.DisplayName, 800, "display-name-too-long");
             await using var tx = await db.Database.BeginTransactionAsync(ct);
             var hash = Wire.Hash(request.Code);
             var invite = await db.Invites.SingleOrDefaultAsync(i => i.TokenHash == hash, ct);
-            if (invite is null || invite.ConsumedBy is not null || invite.ExpiresAt <= clock.GetUtcNow().UtcDateTime)
+            if (invite is null || invite.ExpiresAt <= clock.GetUtcNow().UtcDateTime)
                 throw ApiProblem.Invalid("invite-unavailable");
+            var input = new { invite.Id, request.Handle, request.DisplayName };
+            if (invite.ConsumedBy is { } consumedBy)
+            {
+                var previous = await receipts.Prepare(consumedBy, "redeem", ctx.Request, input, ct);
+                if (previous.ResourceId is null) throw ApiProblem.Invalid("invite-unavailable");
+                var existing = await users.FindByIdAsync(consumedBy);
+                if (existing is null || existing.Disabled || !await users.CheckPasswordAsync(existing, request.Password))
+                    throw new ApiProblem(409, "idempotency-mismatch", "The original account credentials do not match.");
+                await tx.CommitAsync(ct);
+                await signin.SignInAsync(existing, false);
+                return Results.Ok(Profile(existing));
+            }
             var account = new Account { UserName = request.Handle, DisplayName = request.DisplayName ?? request.Handle };
+            var intent = await receipts.Prepare(account.Id, "redeem", ctx.Request, input, ct);
             var created = await users.CreateAsync(account, request.Password);
             if (!created.Succeeded) throw ApiProblem.Invalid("account-validation");
             invite.ConsumedBy = account.Id;
+            receipts.Record(account.Id, "redeem", intent, Guid.Parse(account.Id));
             await db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);
             await signin.SignInAsync(account, false);
@@ -105,6 +120,7 @@ public static partial class AccountEndpoints
             AppDbContext db, UserManager<Account> users, SignInManager<Account> signin, TimeProvider clock, CancellationToken ct) =>
         {
             var account = await Current(ctx, db, ct);
+            if (request.Password.Length > 1024) throw ApiProblem.Invalid("password-input-limit");
             if (!await users.CheckPasswordAsync(account, request.Password)) throw new ApiProblem(403, "password-confirmation-failed", "Password confirmation failed.");
             await signin.SignInWithClaimsAsync(account, false,
                 [new Claim("confirmed-at", clock.GetUtcNow().ToUnixTimeSeconds().ToString(System.Globalization.CultureInfo.InvariantCulture))]);
@@ -114,21 +130,28 @@ public static partial class AccountEndpoints
             UserManager<Account> users, SignInManager<Account> signin, CancellationToken ct) =>
         {
             var account = await Current(ctx, db, ct);
-            if (request.NewPassword is null || !(await users.ChangePasswordAsync(account, request.Password, request.NewPassword)).Succeeded)
+            if (request.Password.Length > 1024 || request.NewPassword is null || request.NewPassword.Length > 1024
+                || !(await users.ChangePasswordAsync(account, request.Password, request.NewPassword)).Succeeded)
                 throw ApiProblem.Invalid("password-change-failed");
             await signin.RefreshSignInAsync(account);
             return Results.NoContent();
         }).RequireAuthorization().RequireRateLimiting("login");
-        api.MapPost("/admin/invites", async (HttpContext ctx, AppDbContext db, TimeProvider clock, CancellationToken ct) =>
+        api.MapPost("/admin/invites", async (HttpContext ctx, AppDbContext db, TimeProvider clock, CreateReceipts receipts, CancellationToken ct) =>
         {
             var account = await Admin(ctx, db, ct);
+            await using var tx = await db.Database.BeginTransactionAsync(ct);
+            var intent = await receipts.Prepare(account.Id, "invite", ctx.Request, null, ct);
+            if (intent.ResourceId is { } previous)
+                return Results.Ok(new { id = previous, code = (string?)null, replayed = true });
             if (await db.Invites.CountAsync(i => i.ConsumedBy == null && i.ExpiresAt > DateTime.UtcNow, ct) >= 100)
                 throw new ApiProblem(409, "invite-quota", "The invite quota is exhausted.");
             var code = Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(32));
-            db.Invites.Add(new Invite { TokenHash = Wire.Hash(code), CreatorId = account.Id,
-                ExpiresAt = clock.GetUtcNow().UtcDateTime.AddDays(2) });
+            var invite = new Invite { TokenHash = Wire.Hash(code), CreatorId = account.Id, ExpiresAt = clock.GetUtcNow().UtcDateTime.AddDays(2) };
+            db.Invites.Add(invite);
+            receipts.Record(account.Id, "invite", intent, invite.Id);
             await db.SaveChangesAsync(ct);
-            return Results.Ok(new { code });
+            await tx.CommitAsync(ct);
+            return Results.Ok(new { id = invite.Id, code, replayed = false });
         }).RequireAuthorization();
         foreach (var disable in new[] { true, false })
             api.MapPost($"/admin/accounts/{{id}}/{(disable ? "disable" : "enable")}",
@@ -146,5 +169,5 @@ public static partial class AccountEndpoints
     }
 
     [GeneratedRegex("^[a-z][a-z0-9-]{1,31}$")]
-    private static partial Regex Handle();
+    internal static partial Regex Handle();
 }

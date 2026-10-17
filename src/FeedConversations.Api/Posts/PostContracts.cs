@@ -15,7 +15,7 @@ public sealed record TargetIdentity(string Kind, string? Value = null, string? F
 }
 public sealed record TargetReference(string Permalink, TargetIdentity Identity);
 public sealed record Relationship(string Kind, TargetReference Target);
-public sealed record CreatePost(string? Title, string? Markdown, Relationship? Relationship);
+public sealed record CreatePost(string? Title = null, string? Markdown = null, Relationship? Relationship = null);
 public static class PostContracts
 {
     public static object Dto(Post p) => new

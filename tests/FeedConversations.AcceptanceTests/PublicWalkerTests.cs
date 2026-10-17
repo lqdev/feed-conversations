@@ -108,4 +108,41 @@ public sealed class PublicWalkerTests
             Assert.All(expected, url => Assert.Contains(url, visited));
         }
     }
+
+    [Fact]
+    public async Task RealPeerStorageAndCapturedLogsDoNotRetainForeignBodySentinel()
+    {
+        var runtime = Path.Combine(RootDirectory(), ".runtime");
+        var targets = JsonSerializer.Deserialize<Targets>(await File.ReadAllTextAsync(Path.Combine(runtime, "walker-target.json")),
+            new JsonSerializerOptions { PropertyNameCaseInsensitive = true })!;
+        using var client = Client();
+        var item = Assert.Single(Items(await Get(client, targets.Root + "/rss.xml")));
+        var match = System.Text.RegularExpressions.Regex.Match(item.Element("description")!.Value, @"A root [a-f0-9-]{36}");
+        Assert.True(match.Success, "The browser acceptance root must contain its unique synthetic sentinel.");
+        var needle = System.Text.Encoding.UTF8.GetBytes(match.Value);
+        var directories = new List<string> { Path.Combine(runtime, "b") };
+        if (Environment.GetEnvironmentVariable("FC_ACCEPTANCE_LOG_DIRECTORY") is { } logs)
+        {
+            Assert.StartsWith(Path.GetFullPath(runtime) + Path.DirectorySeparatorChar, Path.GetFullPath(logs), StringComparison.OrdinalIgnoreCase);
+            directories.Add(logs);
+        }
+        foreach (var directory in directories)
+        {
+            Assert.True(Directory.Exists(directory));
+            foreach (var file in Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories))
+            {
+                await using var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                var buffer = new byte[65536 + needle.Length];
+                var retained = 0;
+                int read;
+                while ((read = await stream.ReadAsync(buffer.AsMemory(retained, 65536))) > 0)
+                {
+                    var length = retained + read;
+                    Assert.False(buffer.AsSpan(0, length).IndexOf(needle) >= 0, "A foreign body sentinel was retained in peer storage or captured logs.");
+                    retained = Math.Min(needle.Length - 1, length);
+                    buffer.AsSpan(length - retained, retained).CopyTo(buffer);
+                }
+            }
+        }
+    }
 }

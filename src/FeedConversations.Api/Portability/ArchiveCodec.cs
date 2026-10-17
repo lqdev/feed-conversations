@@ -19,21 +19,30 @@ public sealed record AccountArchive(ArchiveManifest Manifest, ArchiveProfile Pro
     List<OpmlEntry> Subscriptions, List<ViewDefinition> Views);
 public sealed class ArchiveCodec(OpmlCodec opml)
 {
+    private static readonly JsonSerializerOptions ArchiveJson = new(Wire.Json) { RespectRequiredConstructorParameters = true };
     private static readonly string[] Names = ["manifest.json", "profile.json", "posts.json", "subscriptions.opml", "views.json"];
     public byte[] Write(AccountArchive archive)
     {
-        var files = new Dictionary<string, byte[]>
+        if (archive.Posts.Count > ResourceLimits.ArchivePosts) throw new ApiProblem(413, "archive-too-large", "The full archive exceeds its post limit.");
+        var files = new Dictionary<string, byte[]>();
+        long total = 0;
+        void Json<T>(string name, T value)
         {
-            ["profile.json"] = JsonSerializer.SerializeToUtf8Bytes(archive.Profile, Wire.Json),
-            ["posts.json"] = JsonSerializer.SerializeToUtf8Bytes(archive.Posts, Wire.Json),
-            ["subscriptions.opml"] = Encoding.UTF8.GetBytes(opml.Write(archive.Subscriptions)),
-            ["views.json"] = JsonSerializer.SerializeToUtf8Bytes(archive.Views, Wire.Json)
-        };
+            using var buffer = new ArchiveBuffer(ResourceLimits.ArchiveBytes - total);
+            JsonSerializer.Serialize(buffer, value, Wire.Json);
+            files[name] = buffer.ToArray();
+            total += buffer.Length;
+        }
+        Json("profile.json", archive.Profile);
+        Json("posts.json", archive.Posts);
+        files["subscriptions.opml"] = Encoding.UTF8.GetBytes(opml.Write(archive.Subscriptions));
+        total += files["subscriptions.opml"].Length;
+        Json("views.json", archive.Views);
         var manifest = archive.Manifest with { Checksums = files.ToDictionary(f => f.Key, f => Hash(f.Value)) };
-        files["manifest.json"] = JsonSerializer.SerializeToUtf8Bytes(manifest, Wire.Json);
+        Json("manifest.json", manifest);
         if (files.Values.Sum(v => (long)v.Length) > ResourceLimits.ArchiveBytes || archive.Posts.Count > ResourceLimits.ArchivePosts)
             throw new ApiProblem(413, "archive-too-large", "The full archive exceeds its limit.");
-        using var memory = new MemoryStream();
+        using var memory = new ArchiveBuffer(ResourceLimits.ArchiveBytes);
         using (var zip = new ZipArchive(memory, ZipArchiveMode.Create, true))
             foreach (var file in files)
             {
@@ -68,9 +77,10 @@ public sealed class ArchiveCodec(OpmlCodec opml)
                     if (buffer.Length + read > entry.Length) throw ApiProblem.Invalid("archive-length");
                     buffer.Write(block, 0, read);
                 }
+                if (buffer.Length != entry.Length) throw ApiProblem.Invalid("archive-length");
                 files.Add(entry.FullName, buffer.ToArray());
             }
-            T Read<T>(string name) => JsonSerializer.Deserialize<T>(files[name], Wire.Json) ?? throw ApiProblem.Invalid("archive-json");
+            T Read<T>(string name) => JsonSerializer.Deserialize<T>(files[name], ArchiveJson) ?? throw ApiProblem.Invalid("archive-json");
             var manifest = Read<ArchiveManifest>("manifest.json");
             if (manifest.Version != 1 || manifest.ExportId.Length > 64 || manifest.SourceInstance.Length is 0 or > 64
                 || manifest.SourceAccount.Length is 0 or > 200 || manifest.Cursor.Length > 8192
@@ -79,7 +89,8 @@ public sealed class ArchiveCodec(OpmlCodec opml)
                 throw ApiProblem.Invalid("archive-checksum");
             Networking.UrlPolicy.Parse(manifest.PublicBaseUrl);
             var posts = Read<List<ArchivePost>>("posts.json");
-            if (posts.Count != manifest.PostCount || posts.Count > ResourceLimits.ArchivePosts || posts.Any(p => p is null)
+            if (posts.Count > ResourceLimits.ArchivePosts) throw new ApiProblem(413, "archive-too-large", "The archive exceeds its post limit.");
+            if (posts.Count != manifest.PostCount || posts.Any(p => p is null)
                 || posts.Select(p => p.Guid).Distinct().Count() != posts.Count
                 || posts.Select(p => Networking.UrlPolicy.Key(p.Permalink)).Distinct().Count() != posts.Count)
                 throw ApiProblem.Invalid("archive-post-identities");

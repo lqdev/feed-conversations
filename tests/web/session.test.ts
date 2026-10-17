@@ -39,6 +39,22 @@ beforeEach(() => {
 afterEach(() => { active.dispose(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 describe("instance observation lifetime", () => {
+  it("closing both viewers stops every refresh while subscriptions alone never ingest", async () => {
+    const second = new InstanceSession(connection, account);
+    try {
+      await active.start(); await second.start();
+      expect(reads).toHaveLength(0);
+      for (const viewer of [active, second])
+        viewer.selectedView.next({ ...viewer.selectedView.value, sourceFeedUrls: ["https://controlled.example/shared"] });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(reads).toHaveLength(2);
+      active.dispose(); second.dispose();
+      expect(reads.every(signal => signal.aborted)).toBe(true);
+      await vi.advanceTimersByTimeAsync(90_000);
+      expect(reads).toHaveLength(2);
+    } finally { second.dispose(); }
+  });
+
   it("stops refresh and aborts replaceable reads when the timeline is unobserved", async () => {
     await active.start();
     active.selectedView.next({ ...active.selectedView.value, sourceFeedUrls: ["https://controlled.example/feed"] });

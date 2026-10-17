@@ -1,10 +1,13 @@
-# feed-conversations: proposed MVP implementation plan
+# feed-conversations: approved MVP implementation contract
 
 ## Status
 
-This repository contains a design, not an implemented application. No API,
-browser client, Aspire topology, database, or executable test suite is provided
-yet. File names, commands, and test cases below are implementation requirements.
+This document was approved before application code existed. The repository now
+contains the API, browser client, Aspire topology, migrations and executable
+checks. Requirements below remain the acceptance contract, not an automatic
+claim that every gate has passed. See README and the acceptance evidence for
+current implementation/verification status. Source publication was subsequently
+authorized; application hosting and third-party notification tests were not.
 
 ## Goal and confirmed choices
 
@@ -49,7 +52,7 @@ content or send unsolicited notifications to third-party services.
 
 ### Excluded
 
-Blog/article publishing mode; media uploads/mirroring; private posts/bookmarks/DMs; reposts, emoji reactions, RSVP; notifications inbox/ranking; public signup; email delivery/password reset email; IndieAuth/passkeys/OAuth/API tokens; Micropub/Microsub; ActivityPub; WebSub/rssCloud; NATS or any broker; Rx.NET; permanent foreign-body storage/history; automatic full-feed acquisition; global conversation completeness; arbitrary-origin browser attachment/open proxies; seamless domain migration; replicated writers sharing SQLite; public repository publication or public hosting.
+Blog/article publishing mode; media uploads/mirroring; private posts/bookmarks/DMs; reposts, emoji reactions, RSVP; notifications inbox/ranking; public signup; email delivery/password reset email; IndieAuth/passkeys/OAuth/API tokens; Micropub/Microsub; ActivityPub; WebSub/rssCloud; NATS or any broker; Rx.NET; permanent foreign-body storage/history; automatic full-feed acquisition; global conversation completeness; arbitrary-origin browser attachment/open proxies; seamless domain migration; replicated writers sharing SQLite; public application hosting.
 
 Invites gate account creation, not public reading or external participation. Alice's account on A is not a global account usable on B. An external publisher needs no receiving-instance account to send a valid public Webmention.
 

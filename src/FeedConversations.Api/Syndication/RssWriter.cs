@@ -51,7 +51,9 @@ public sealed class RssWriter
     {
         var item = new XElement("item", new XElement("guid",
             entry.Identity.IsPermaLink is null ? null : new XAttribute("isPermaLink", entry.Identity.IsPermaLink), entry.Identity.Guid ?? entry.Identity.Value),
-            new XElement("link", entry.Permalink), new XElement("description", entry.Html));
+            new XElement("link", entry.Permalink), new XElement("description",
+                (entry.TargetUrl is null || entry.Kind is not ("reply" or "like" or "bookmark") ? ""
+                    : $"<p>{PublicationHtml.Label(entry.Kind)} <a href=\"{PublicationHtml.E(entry.TargetUrl)}\">this page</a>.</p>") + entry.Html));
         if (entry.Title is not null) item.Add(new XElement("title", entry.Title));
         if (entry.PublishedAt is { } published) item.Add(new XElement("pubDate", published.ToString("R", CultureInfo.InvariantCulture)));
         if (entry.UpdatedAt is { } updated) item.Add(new XElement(SemanticProfile.Atom + "updated", updated.ToString("O")));

@@ -5,6 +5,7 @@ using System.Net.Security;
 using System.Security.Cryptography.X509Certificates;
 using FeedConversations.Api.Configuration;
 using FeedConversations.Api.Infrastructure;
+using FeedConversations.Api.Operations;
 
 namespace FeedConversations.Api.Networking;
 
@@ -15,6 +16,7 @@ public interface IRemoteFetcher
 {
     bool TryGetCached(string url, out RemoteDocument? document) { document = null; return false; }
     Task<RemoteDocument> GetAsync(string url, CancellationToken token);
+    Task<RemoteDocument> GetFreshAsync(string url, CancellationToken token) => GetAsync(url, token);
     Task<RemoteDocument> PostAsync(string url, string source, string target, CancellationToken token);
 }
 
@@ -60,10 +62,26 @@ public sealed class SafeRemoteFetcher(InstanceOptions options, TimeProvider cloc
                 if (inflight.Count >= 64) throw new ApiProblem(503, "fetch-capacity", "Remote retrieval is busy.");
                 task = FetchAndCacheAsync(key, url);
                 inflight.Add(key, task);
+                OperationMetrics.Inflight.Add(1);
             }
         }
         // Each consumer cancels only its wait, not another consumer's shared retrieval.
         return await task.WaitAsync(token);
+    }
+
+    public async Task<RemoteDocument> GetFreshAsync(string url, CancellationToken token)
+    {
+        var key = UrlPolicy.Key(url);
+        Task<RemoteDocument>? previous;
+        lock (gate) inflight.TryGetValue(key, out previous);
+        if (previous is not null) await previous.WaitAsync(token);
+        lock (gate)
+            if (cache.Remove(key, out var old))
+            {
+                bytes -= old.Document.Bytes.Length;
+                OperationMetrics.CacheBytes.Add(-old.Document.Bytes.Length);
+            }
+        return await GetAsync(url, token);
     }
 
     private async Task<RemoteDocument> FetchAndCacheAsync(string key, string url)
@@ -74,22 +92,32 @@ public sealed class SafeRemoteFetcher(InstanceOptions options, TimeProvider cloc
             var document = await SendAsync(url, null, null, CancellationToken.None);
             lock (gate)
             {
-                if (cache.Remove(key, out var old)) bytes -= old.Document.Bytes.Length;
+                if (cache.Remove(key, out var old))
+                {
+                    bytes -= old.Document.Bytes.Length;
+                    OperationMetrics.CacheBytes.Add(-old.Document.Bytes.Length);
+                }
                 if (!document.NoStore && document.Status == 200)
                 {
                     while (cache.Count >= 128 || bytes + document.Bytes.Length > ResourceLimits.CacheBytes)
                     {
                         var victim = cache.MinBy(pair => pair.Value.Used);
                         bytes -= victim.Value.Document.Bytes.Length;
+                        OperationMetrics.CacheBytes.Add(-victim.Value.Document.Bytes.Length);
                         cache.Remove(victim.Key);
                     }
                     cache[key] = (document, ++tick);
                     bytes += document.Bytes.Length;
+                    OperationMetrics.CacheBytes.Add(document.Bytes.Length);
                 }
             }
             return document;
         }
-        finally { lock (gate) inflight.Remove(key); }
+        finally
+        {
+            lock (gate) inflight.Remove(key);
+            OperationMetrics.Inflight.Add(-1);
+        }
     }
 
     public Task<RemoteDocument> PostAsync(string url, string source, string target, CancellationToken token) =>
@@ -97,8 +125,9 @@ public sealed class SafeRemoteFetcher(InstanceOptions options, TimeProvider cloc
 
     private async Task<RemoteDocument> SendAsync(string url, string? source, string? target, CancellationToken token)
     {
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
-        deadline.CancelAfter(TimeSpan.FromSeconds(10));
+        var started = clock.GetTimestamp();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10), clock);
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token, timeout.Token);
         try
         {
             await global.WaitAsync(deadline.Token);
@@ -194,6 +223,7 @@ public sealed class SafeRemoteFetcher(InstanceOptions options, TimeProvider cloc
                                 || response.Headers.CacheControl?.NoCache == true;
                             var retry = response.Headers.RetryAfter?.Delta
                                 ?? (response.Headers.RetryAfter?.Date - clock.GetUtcNow());
+                            OperationMetrics.RemoteBytes.Record(buffer.Length);
                             return new RemoteDocument(current, status, type, buffer.ToArray(),
                                 response.Headers.TryGetValues("Link", out var links) ? links.Take(32).ToArray() : [],
                                 now, now + age, noStore, retry);
@@ -214,9 +244,11 @@ public sealed class SafeRemoteFetcher(InstanceOptions options, TimeProvider cloc
             finally { global.Release(); }
         }
         catch (OperationCanceledException) when (!token.IsCancellationRequested)
-        { throw new ApiProblem(502, "remote-timeout", "Remote retrieval timed out."); }
-        catch (HttpRequestException) { throw new ApiProblem(502, "remote-transport", "Remote retrieval failed."); }
-        catch (SocketException) { throw new ApiProblem(502, "remote-dns", "Remote address resolution failed."); }
+        { OperationMetrics.RemoteFailures.Add(1); throw new ApiProblem(502, "remote-timeout", "Remote retrieval timed out."); }
+        catch (HttpRequestException) { OperationMetrics.RemoteFailures.Add(1); throw new ApiProblem(502, "remote-transport", "Remote retrieval failed."); }
+        catch (SocketException) { OperationMetrics.RemoteFailures.Add(1); throw new ApiProblem(502, "remote-dns", "Remote address resolution failed."); }
+        catch (ApiProblem) { OperationMetrics.RemoteFailures.Add(1); throw; }
+        finally { OperationMetrics.RemoteDuration.Record(clock.GetElapsedTime(started).TotalMilliseconds); }
     }
 
     private async ValueTask<Stream> ConnectAsync(DnsEndPoint destination, string origin, CancellationToken token)
@@ -229,5 +261,14 @@ public sealed class SafeRemoteFetcher(InstanceOptions options, TimeProvider cloc
         return await connector.ConnectAsync(new IPEndPoint(addresses[0], destination.Port), token);
     }
 
-    public void Dispose() => global.Dispose();
+    public void Dispose()
+    {
+        lock (gate)
+        {
+            OperationMetrics.CacheBytes.Add(-bytes);
+            bytes = 0;
+            cache.Clear();
+        }
+        global.Dispose();
+    }
 }

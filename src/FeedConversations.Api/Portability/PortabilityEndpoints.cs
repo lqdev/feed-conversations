@@ -23,7 +23,21 @@ public static class PortabilityEndpoints
             Confirmed(ctx);
             var owner = await AccountEndpoints.Current(ctx, db, ct);
             await using var tx = await db.Database.BeginTransactionAsync(ct);
-            var posts = await db.Posts.Where(p => p.OwnerId == owner.Id).Take(ResourceLimits.ArchivePosts + 1).ToListAsync(ct);
+            var minimumBytes = await db.Database.SqlQuery<long>($"""
+                SELECT COALESCE(SUM(
+                    length(CAST(COALESCE("Guid",'') AS BLOB)) +
+                    length(CAST(COALESCE("Permalink",'') AS BLOB)) +
+                    length(CAST(COALESCE("Title",'') AS BLOB)) +
+                    length(CAST(COALESCE("Markdown",'') AS BLOB)) +
+                    length(CAST(COALESCE("TargetUrl",'') AS BLOB)) +
+                    length(CAST(COALESCE("TargetIdentityJson",'') AS BLOB)) +
+                    length(CAST(COALESCE("Provenance",'') AS BLOB))),0) AS Value
+                FROM Posts WHERE OwnerId = {owner.Id}
+                """).SingleAsync(ct);
+            if (minimumBytes > ResourceLimits.ArchiveBytes) throw new ApiProblem(413, "archive-too-large", "Owned state exceeds the archive byte limit.");
+            var posts = await db.Posts.Where(p => p.OwnerId == owner.Id).Select(p => new
+            { p.Guid, p.Permalink, p.PublishedAt, p.UpdatedAt, p.Revision, p.Kind, p.Title, p.Markdown,
+                p.TargetUrl, p.TargetIdentityJson, p.DeletedAt, p.Provenance }).Take(ResourceLimits.ArchivePosts + 1).ToListAsync(ct);
             if (posts.Count > ResourceLimits.ArchivePosts) throw new ApiProblem(413, "archive-post-limit", "Owned publications exceed archive limit.");
             var subscriptions = await db.Subscriptions.Where(s => s.OwnerId == owner.Id).Select(s => new OpmlEntry(s.Url, s.Label, s.Group)).ToListAsync(ct);
             var views = await db.Views.Where(v => v.OwnerId == owner.Id).ToListAsync(ct);
@@ -52,7 +66,7 @@ public static class PortabilityEndpoints
             var bytes = await ReadArchive(ctx.Request, ct);
             var checksum = ArchiveCodec.Hash(bytes);
             if (ctx.Request.Headers["X-Archive-SHA256"] != checksum) throw ApiProblem.Invalid("archive-preview-hash-required");
-            return Results.Ok(await restore.Commit(codec.Read(bytes), checksum, owner, ct));
+            return Results.Ok(await restore.Commit(codec.Read(bytes), checksum, owner, ctx.Request.Headers["Idempotency-Key"].ToString(), ct));
         });
     }
     private static void Confirmed(HttpContext ctx)

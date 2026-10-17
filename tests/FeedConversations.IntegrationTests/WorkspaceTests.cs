@@ -16,10 +16,14 @@ namespace FeedConversations.IntegrationTests;
 public sealed class FakeRemote : IRemoteFetcher
 {
     public Dictionary<string, RemoteDocument> Documents { get; } = [];
+    public System.Collections.Concurrent.ConcurrentQueue<string> Reads { get; } = new();
     public List<(string Url, string Source, string Target)> Writes { get; } = [];
-    public Task<RemoteDocument> GetAsync(string url, CancellationToken token) =>
-        Task.FromResult(Documents.TryGetValue(url, out var document) ? document
+    public Task<RemoteDocument> GetAsync(string url, CancellationToken token)
+    {
+        Reads.Enqueue(url);
+        return Task.FromResult(Documents.TryGetValue(url, out var document) ? document
             : new RemoteDocument(new Uri(url), 503, "text/html", [], [], DateTime.UtcNow, DateTime.UtcNow, true, null));
+    }
     public Task<RemoteDocument> PostAsync(string url, string source, string target, CancellationToken token)
     {
         Writes.Add((url, source, target));
@@ -49,6 +53,7 @@ public sealed class WorkspaceTests
             Assert.Single(subs.GetProperty("items").EnumerateArray());
             Assert.Equal("Group", subs.GetProperty("items")[0].GetProperty("group").GetString());
             Assert.Empty(remote.Writes);
+            Assert.Empty(remote.Reads);
             var view = await alice.PostAsJsonAsync("/api/v1/views", new { version = 1, name = "Following", includeLocal = true,
                 sourceFeedUrls = new[] { "https://publisher.example/rss.xml" }, textContains = "hello", textExcludes = (string?)null,
                 sort = "published-desc", entryKinds = new[] { "post", "reply" } });
@@ -62,6 +67,16 @@ public sealed class WorkspaceTests
                 Assert.Empty(privateViews.GetProperty("items").EnumerateArray());
             }
             Assert.DoesNotContain("publisher.example", await alice.GetStringAsync("/data/subs.opml"));
+            Assert.DoesNotContain("/users/alice/rss.xml", await alice.GetStringAsync("/data/subs.opml"));
+            var profile = await alice.GetAsync("/api/v1/me");
+            using var optIn = new HttpRequestMessage(HttpMethod.Patch, "/api/v1/me")
+                { Content = JsonContent.Create(new { directoryVisible = true }) };
+            optIn.Headers.TryAddWithoutValidation("If-Match", profile.Headers.ETag!.Tag);
+            Assert.True((await alice.SendAsync(optIn)).IsSuccessStatusCode);
+            var directory = await alice.GetStringAsync("/data/subs.opml");
+            Assert.Contains("/users/alice/rss.xml", directory);
+            Assert.DoesNotContain("/users/bob/rss.xml", directory);
+            Assert.DoesNotContain("publisher.example", directory);
         }
     }
 
@@ -93,7 +108,8 @@ public sealed class WorkspaceTests
                 await using var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
                 using var buffer = new MemoryStream();
                 await stream.CopyToAsync(buffer);
-                Assert.DoesNotContain(sentinel, Encoding.UTF8.GetString(buffer.ToArray()));
+                Assert.False(Encoding.UTF8.GetString(buffer.ToArray()).Contains(sentinel, StringComparison.Ordinal),
+                    "Foreign body sentinel was found in scoped durable storage.");
             }
             Assert.Empty(await db.Posts.ToListAsync());
         }

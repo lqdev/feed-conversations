@@ -12,24 +12,30 @@ using Microsoft.EntityFrameworkCore;
 namespace FeedConversations.Api.Portability;
 
 public sealed record RestorePreview(string Checksum, int New, int Unchanged, int Conflicts, bool AlreadyImported);
-public sealed class RestoreService(AppDbContext db, InstanceOptions options, ChangeJournal journal)
+public sealed class RestoreService(AppDbContext db, InstanceOptions options, ChangeJournal journal, CreateReceipts receipts)
 {
     public async Task<RestorePreview> Preview(AccountArchive archive, string checksum, string owner, CancellationToken ct)
     {
         var imported = await db.ImportRuns.AnyAsync(r => r.OwnerId == owner && r.Checksum == checksum, ct);
+        if (imported) return new RestorePreview(checksum, 0, archive.Posts.Count, 0, true);
         var source = $"{archive.Manifest.SourceInstance}:{archive.Manifest.SourceAccount}";
+        var mappings = await db.RestoredMappings.AsNoTracking().Where(m => m.OwnerId == owner && m.SourceIdentity == source)
+            .ToDictionaryAsync(m => m.OriginalGuid, ct);
+        var guids = archive.Posts.Select(p => p.Guid).ToArray();
+        var existing = await db.Posts.AsNoTracking().Where(p => guids.Contains(p.Guid))
+            .Select(p => new { p.Id, p.Guid, p.Revision, p.DeletedAt }).ToDictionaryAsync(p => p.Guid, ct);
         var added = 0; var unchanged = 0; var conflicts = 0;
         foreach (var entry in archive.Posts)
         {
-            var mapping = await db.RestoredMappings.SingleOrDefaultAsync(m => m.OwnerId == owner && m.SourceIdentity == source && m.OriginalGuid == entry.Guid, ct);
-            if (mapping is null)
+            if (!mappings.TryGetValue(entry.Guid, out var mapping))
             {
-                if (await db.Posts.AnyAsync(p => p.Guid == entry.Guid, ct)) conflicts++;
+                if (existing.ContainsKey(entry.Guid)) conflicts++;
                 else added++;
             }
             else
             {
-                var post = await db.Posts.SingleAsync(p => p.Id == mapping.PostId, ct);
+                if (!existing.TryGetValue(entry.Guid, out var post) || post.Id != mapping.PostId)
+                    throw new ApiProblem(409, "restore-mapping-inconsistent", "The destination mapping no longer matches its publication.");
                 var hash = Wire.Hash(JsonSerializer.Serialize(entry, Wire.Json));
                 if (mapping.ImportedHash == hash) unchanged++;
                 else if (post.Revision != mapping.DestinationRevision || post.DeletedAt is not null && entry.DeletedAt is null) conflicts++;
@@ -39,23 +45,41 @@ public sealed class RestoreService(AppDbContext db, InstanceOptions options, Cha
         return new RestorePreview(checksum, added, unchanged, conflicts, imported);
     }
 
-    public async Task<RestorePreview> Commit(AccountArchive archive, string checksum, Account owner, CancellationToken ct)
+    public async Task<RestorePreview> Commit(AccountArchive archive, string checksum, Account owner, string key, CancellationToken ct)
     {
         await using var tx = await db.Database.BeginTransactionAsync(ct);
+        var intent = await receipts.Prepare(owner.Id, "archive", key, checksum, ct);
         var preview = await Preview(archive, checksum, owner.Id, ct);
-        if (preview.AlreadyImported) return preview;
+        if (preview.AlreadyImported)
+        {
+            if (intent.ResourceId is null) receipts.Record(owner.Id, "archive", intent, Guid.Empty);
+            await db.SaveChangesAsync(ct);
+            await tx.CommitAsync(ct);
+            return preview;
+        }
         if (preview.Conflicts != 0) throw new ApiProblem(409, "restore-conflict", "The archive conflicts with destination publications.");
         var source = $"{archive.Manifest.SourceInstance}:{archive.Manifest.SourceAccount}";
-        var mappings = await db.RestoredMappings.Where(m => m.OwnerId == owner.Id && m.SourceIdentity == source).ToListAsync(ct);
+        var mappings = await db.RestoredMappings.Where(m => m.OwnerId == owner.Id && m.SourceIdentity == source).ToDictionaryAsync(m => m.OriginalGuid, ct);
+        var mappedIds = mappings.Values.Select(m => m.PostId).ToArray();
+        var destination = await db.Posts.AsNoTracking().Where(p => mappedIds.Contains(p.Id)).Select(p => new Post
+        {
+            Id = p.Id, OwnerId = p.OwnerId, Guid = p.Guid, Permalink = p.Permalink, PublishedAt = p.PublishedAt,
+            UpdatedAt = p.UpdatedAt, Revision = p.Revision, Kind = p.Kind, TargetKey = p.TargetKey, TargetUrl = p.TargetUrl,
+            TargetIdentityJson = p.TargetIdentityJson, LocalTargetId = p.LocalTargetId, DeletedAt = p.DeletedAt, Hidden = p.Hidden
+        }).ToDictionaryAsync(p => p.Id, ct);
         var restored = new Dictionary<string, Post>();
-        var previousIdentity = new Dictionary<Guid, (string Kind, string? TargetKey, string? TargetUrl)>();
+        var previousIdentity = new Dictionary<Guid, (string Kind, string? TargetKey, string? TargetUrl, DateTime PublishedAt)>();
         foreach (var entry in archive.Posts)
         {
-            var mapping = mappings.SingleOrDefault(m => m.OriginalGuid == entry.Guid);
+            mappings.TryGetValue(entry.Guid, out var mapping);
             var hash = Wire.Hash(JsonSerializer.Serialize(entry, Wire.Json));
             var post = mapping is null ? new Post { OwnerId = owner.Id, Owner = owner, Guid = entry.Guid }
-                : await db.Posts.SingleAsync(p => p.Id == mapping.PostId, ct);
-            if (mapping is not null) previousIdentity[post.Id] = (post.Kind, post.TargetKey, post.TargetUrl);
+                : destination[mapping.PostId];
+            if (mapping is not null)
+            {
+                previousIdentity[post.Id] = (post.Kind, post.TargetKey, post.TargetUrl, post.PublishedAt);
+                db.Attach(post);
+            }
             restored[entry.Permalink] = post;
             if (mapping?.ImportedHash == hash) continue;
             if (mapping is null) { post.Permalink = $"{options.BaseUrl}/post/{post.Id}"; db.Posts.Add(post); }
@@ -71,6 +95,18 @@ public sealed class RestoreService(AppDbContext db, InstanceOptions options, Cha
             post.TargetUrl = entry.Relationship?.Target.Permalink;
             post.TargetIdentityJson = entry.Relationship is null ? null : JsonSerializer.Serialize(entry.Relationship.Target.Identity, Wire.Json);
             post.TargetKey = entry.Relationship?.Target.Identity.AsEntry().Key;
+            if (mapping is not null)
+            {
+                var tracked = db.Entry(post);
+                tracked.Property(p => p.Title).IsModified = true;
+                tracked.Property(p => p.Markdown).IsModified = true;
+                tracked.Property(p => p.Html).IsModified = true;
+                tracked.Property(p => p.UpdatedAt).IsModified = true;
+                tracked.Property(p => p.DeletedAt).IsModified = true;
+                tracked.Property(p => p.Revision).IsModified = true;
+                tracked.Property(p => p.Provenance).IsModified = true;
+                tracked.Property(p => p.TargetIdentityJson).IsModified = true;
+            }
             if (mapping is null)
             {
                 mapping = new RestoredPostMapping { OwnerId = owner.Id, SourceIdentity = source, OriginalGuid = entry.Guid, PostId = post.Id };
@@ -92,7 +128,7 @@ public sealed class RestoreService(AppDbContext db, InstanceOptions options, Cha
                 post.LocalTargetId = target.Id;
             }
             if (previousIdentity.TryGetValue(post.Id, out var previous)
-                && (previous.Kind != post.Kind || previous.TargetKey != post.TargetKey || previous.TargetUrl != post.TargetUrl))
+                && (previous.Kind != post.Kind || previous.TargetKey != post.TargetKey || previous.TargetUrl != post.TargetUrl || previous.PublishedAt != post.PublishedAt))
                 throw new ApiProblem(409, "restore-identity-conflict", "A later archive cannot change publication kind or target.");
         }
         var active = restored.Values.Where(p => p.DeletedAt is null && p.Kind is "like" or "bookmark").ToList();
@@ -136,6 +172,7 @@ public sealed class RestoreService(AppDbContext db, InstanceOptions options, Cha
         owner.DirectoryVisible = archive.Profile.DirectoryVisible;
         owner.Revision++;
         db.ImportRuns.Add(new ImportRun { OwnerId = owner.Id, Checksum = checksum });
+        receipts.Record(owner.Id, "archive", intent, Guid.Empty);
         ChangeJournal.Add(db, "workspace", owner.Id, owner.Revision, "invalidate", owner.Id);
         await db.SaveChangesAsync(ct);
         await tx.CommitAsync(ct);

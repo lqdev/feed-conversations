@@ -4,6 +4,7 @@ using FeedConversations.Api.Configuration;
 using FeedConversations.Api.Data;
 using FeedConversations.Api.Infrastructure;
 using FeedConversations.Api.Networking;
+using FeedConversations.Api.Operations;
 using FeedConversations.Api.Posts;
 using FeedConversations.Api.Streaming;
 using FeedConversations.Api.Syndication;
@@ -51,6 +52,7 @@ public sealed class MentionWorker(IServiceScopeFactory scopes, IRemoteFetcher fe
             await db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);
             claimed = job;
+            OperationMetrics.JobAttempts.Add(1, new KeyValuePair<string, object?>("direction", claimed.Direction));
         }
         string state;
         string? error = null;
@@ -59,7 +61,7 @@ public sealed class MentionWorker(IServiceScopeFactory scopes, IRemoteFetcher fe
         var withdraw = false;
         try
         {
-            var document = await fetcher.GetAsync(claimed.Direction == "out" ? claimed.TargetUrl : claimed.SourceUrl, ct);
+            var document = await fetcher.GetFreshAsync(claimed.Direction == "out" ? claimed.TargetUrl : claimed.SourceUrl, ct);
             retryAfter = document.RetryAfter;
             if (claimed.Direction == "out")
             {
@@ -85,24 +87,8 @@ public sealed class MentionWorker(IServiceScopeFactory scopes, IRemoteFetcher fe
                 {
                     if (evidence.SingletonUrl is { } singleton)
                     {
-                        var feed = await fetcher.GetAsync(singleton, ct);
-                        if (feed.Status == 200)
-                        {
-                            var matching = reader.Parse(feed.Bytes, feed.FinalUrl).Where(e => UrlPolicy.Key(e.Permalink) == UrlPolicy.Key(claimed.SourceUrl)).ToList();
-                            if (matching.Count == 1)
-                            {
-                                var item = matching[0];
-                                var disagrees = item.SemanticStatus == "ambiguous" || item.TargetUrl is not null &&
-                                    UrlPolicy.Key(item.TargetUrl) != UrlPolicy.Key(claimed.TargetUrl)
-                                    || evidence.Status == "supported" && item.SemanticStatus == "supported" && evidence.Kind != item.Kind;
-                                if (disagrees) evidence = evidence with { Status = "ambiguous", Kind = "mention", Entry = null };
-                                else if (!item.OriginAuthority || item.SemanticStatus == "incomplete")
-                                    evidence = evidence with { Status = "incomplete", Kind = "mention", Entry = null };
-                                else if (item.SemanticStatus == "supported" && item.TargetUrl is not null)
-                                    evidence = evidence with { Status = "supported", Kind = item.Kind, Entry = item,
-                                        AuthorUrl = item.AuthorUrl, AuthorFeedUrl = item.AuthorFeedUrl ?? evidence.AuthorFeedUrl, CommentsUrl = item.CommentsUrl };
-                            }
-                        }
+                        var feed = await fetcher.GetFreshAsync(singleton, ct);
+                        evidence = protocol.CompareFeed(evidence, feed, claimed.SourceUrl, claimed.TargetUrl, reader);
                     }
                     state = "accepted";
                 }
@@ -130,7 +116,9 @@ public sealed class MentionWorker(IServiceScopeFactory scopes, IRemoteFetcher fe
                     try
                     {
                         await posts.CheckReferenceCapacity(claimed.TargetId!.Value, ct);
-                        if (await db.References.CountAsync(r => r.Status == "pending", ct) >= ResourceLimits.PendingReferences)
+                        var autoVisible = options.TrustedOrigins.Contains(new Uri(claimed.SourceUrl).GetLeftPart(UriPartial.Authority))
+                            && evidence.Status is not ("ambiguous" or "incomplete");
+                        if (!autoVisible && await db.References.CountAsync(r => r.Status == "pending", ct) >= ResourceLimits.PendingReferences)
                             throw new ApiProblem(409, "pending-reference-quota", "Pending reference capacity exhausted.");
                     }
                     catch (ApiProblem p) { state = "failed"; error = p.Code; }
@@ -146,6 +134,7 @@ public sealed class MentionWorker(IServiceScopeFactory scopes, IRemoteFetcher fe
                     if (withdraw) reference.Status = "withdrawn";
                     else if (evidence is not null)
                     {
+                        var approved = reference.Status == "visible" && reference.Kind == evidence.Kind;
                         reference.Kind = evidence.Status == "supported" ? evidence.Kind : "mention";
                         reference.AuthorUrl = evidence.AuthorUrl;
                         reference.AuthorFeedUrl = evidence.AuthorFeedUrl;
@@ -153,8 +142,16 @@ public sealed class MentionWorker(IServiceScopeFactory scopes, IRemoteFetcher fe
                         reference.IdentityJson = evidence.Entry is null ? null : JsonSerializer.Serialize(evidence.Entry.Identity, Wire.Json);
                         reference.Error = evidence.Status is "ambiguous" or "incomplete" ? evidence.Status : null;
                         if (reference.Status != "hidden")
-                            reference.Status = options.TrustedOrigins.Contains(new Uri(claimed.SourceUrl).GetLeftPart(UriPartial.Authority))
-                                && reference.Error is null ? "visible" : "pending";
+                        {
+                            var visible = (approved || options.TrustedOrigins.Contains(new Uri(claimed.SourceUrl).GetLeftPart(UriPartial.Authority))) && reference.Error is null;
+                            if (!visible && reference.Status != "pending" && await db.References.CountAsync(r => r.Status == "pending", ct) >= ResourceLimits.PendingReferences)
+                            {
+                                reference.Status = "hidden";
+                                state = "failed";
+                                error = "pending-reference-quota";
+                            }
+                            else reference.Status = visible ? "visible" : "pending";
+                        }
                     }
                     ChangeJournal.Add(db, "interactions", reference.TargetId.ToString(), 0, "invalidate");
                 }
@@ -178,6 +175,7 @@ public sealed class MentionWorker(IServiceScopeFactory scopes, IRemoteFetcher fe
             await db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);
             journal.Signal();
+            OperationMetrics.QueueDepth.Record(await db.Jobs.CountAsync(j => j.State != "accepted" && j.State != "unsupported" && j.State != "failed", ct));
         }
         return true;
     }

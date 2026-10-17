@@ -18,6 +18,17 @@ namespace FeedConversations.IntegrationTests;
 
 public sealed class ApiFixture : WebApplicationFactory<Program>
 {
+    private sealed class IntentHeaders : DelegatingHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            if (request.Method == HttpMethod.Post && request.RequestUri?.AbsolutePath is "/api/v1/subscriptions" or "/api/v1/views"
+                or "/api/v1/opml/import" or "/api/v1/admin/invites" or "/api/v1/auth/redeem-invite" or "/api/v1/import/commit"
+                && !request.Headers.Contains("Idempotency-Key"))
+                request.Headers.Add("Idempotency-Key", Guid.NewGuid().ToString());
+            return base.SendAsync(request, ct);
+        }
+    }
     private readonly string suffix;
     private readonly IRemoteFetcher? remote;
     private readonly TimeProvider? clock;
@@ -46,7 +57,7 @@ public sealed class ApiFixture : WebApplicationFactory<Program>
     });
     public async Task<(HttpClient Client, string Csrf, Account Account)> LoginAsync(string handle = "alice")
     {
-        var client = CreateClient(new WebApplicationFactoryClientOptions { BaseAddress = new Uri($"https://{suffix}.example"), HandleCookies = false, AllowAutoRedirect = false });
+        var client = new HttpClient(new IntentHeaders { InnerHandler = Server.CreateHandler() }) { BaseAddress = new Uri($"https://{suffix}.example") };
         var password = "Test-" + Convert.ToHexString(RandomNumberGenerator.GetBytes(24)) + "!a9";
         passwords[handle] = password;
         Account account;

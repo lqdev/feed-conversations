@@ -10,6 +10,22 @@ namespace FeedConversations.IntegrationTests;
 
 public sealed class PublicationTests
 {
+    [Theory]
+    [InlineData("text/html")]
+    [InlineData("application/rss+xml")]
+    [InlineData("text/event-stream")]
+    public async Task ProtocolAcceptHeaderCannotTurnPublicDomainStatusInto500(string accept)
+    {
+        await using var fixture = new ApiFixture();
+        using var client = fixture.CreateClient();
+        using var request = new HttpRequestMessage(HttpMethod.Get, "/post/" + Guid.NewGuid());
+        request.Headers.Accept.ParseAdd(accept);
+        var response = await client.SendAsync(request);
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Equal("application/problem+json", response.Content.Headers.ContentType!.MediaType);
+        Assert.Equal("post-missing", (await response.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("code").GetString());
+    }
+
     private static async Task<(JsonElement Post, string ETag)> Publish(HttpClient client, object command, string? key = null)
     {
         using var request = new HttpRequestMessage(HttpMethod.Post, "/api/v1/posts") { Content = JsonContent.Create(command) };
@@ -143,5 +159,33 @@ public sealed class PublicationTests
         client.BaseAddress = new Uri("https://a.example");
         Assert.Equal(HttpStatusCode.Unauthorized, (await client.GetAsync("/api/v1/me")).StatusCode);
         Assert.Equal(HttpStatusCode.Forbidden, (await client.PostAsJsonAsync("/api/v1/auth/login", new { handle = "alice", password = "not-a-password" })).StatusCode);
+    }
+
+    [Theory]
+    [InlineData("like")]
+    [InlineData("bookmark")]
+    public async Task ParallelAssociationIntentsCreateOneActivePublicationAndJobAndCannotBypassHide(string kind)
+    {
+        await using var fixture = new ApiFixture(remote: new FakeRemote());
+        var (client, _, _) = await fixture.LoginAsync();
+        using (client)
+        {
+            var command = new { title = (string?)null, markdown = (string?)null, relationship = new { kind,
+                target = new { permalink = "https://controlled.example/ordinary-page",
+                    identity = new { kind = "permalink", value = "https://controlled.example/ordinary-page" } } } };
+            var results = await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => Publish(client, command)));
+            var ids = results.Select(r => r.Post.GetProperty("id").GetGuid()).Distinct().ToArray();
+            var id = Assert.Single(ids);
+            using (var scope = fixture.Services.CreateScope())
+            {
+                var data = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+                Assert.Single(await data.Posts.ToListAsync());
+                Assert.Single(await data.Jobs.ToListAsync());
+            }
+            Assert.Equal(HttpStatusCode.NoContent, (await client.PostAsync($"/api/v1/admin/posts/{id}/hide", null)).StatusCode);
+            using var request = new HttpRequestMessage(HttpMethod.Post, "/api/v1/posts") { Content = JsonContent.Create(command) };
+            request.Headers.Add("Idempotency-Key", Guid.NewGuid().ToString());
+            Assert.Equal(HttpStatusCode.Forbidden, (await client.SendAsync(request)).StatusCode);
+        }
     }
 }

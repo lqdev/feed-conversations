@@ -8,5 +8,5 @@
     "noEmit": true,
     "skipLibCheck": true
   },
-  "include": ["src", "../../tests/web"]
+  "include": ["src", "vite.config.ts", "../../tests/web", "../../tests/browser"]
 }

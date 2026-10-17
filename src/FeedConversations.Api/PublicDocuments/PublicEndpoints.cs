@@ -28,7 +28,7 @@ public static class PublicEndpoints
         });
         app.MapGet("/users/{handle}", async (string handle, HttpContext ctx, AppDbContext db, InstanceOptions o, CancellationToken ct) =>
         {
-            var user = await db.Users.SingleOrDefaultAsync(a => a.UserName == handle && !a.Disabled, ct)
+            var user = await db.Users.SingleOrDefaultAsync(a => a.UserName == handle, ct)
                 ?? throw new ApiProblem(404, "profile-missing", "Profile not found.");
             var posts = await db.Posts.Include(p => p.Owner).Where(p => p.OwnerId == user.Id && p.DeletedAt == null && !p.Hidden)
                 .OrderByDescending(p => p.PublishedAt).ThenByDescending(p => p.Id).Take(50).ToListAsync(ct);
@@ -45,7 +45,7 @@ public static class PublicEndpoints
         app.MapGet("/post/{id:guid}/rss.xml", (Guid id, HttpContext ctx, AppDbContext db, InstanceOptions o, RssWriter writer, CancellationToken ct) =>
             Feed(ctx, db, o, writer, null, id, ct)).RequireRateLimiting("feed");
         app.MapGet("/post/{id:guid}/comments.xml", async (Guid id, HttpContext ctx, AppDbContext db, InstanceOptions o,
-            RssWriter writer, IRemoteFetcher fetcher, WebmentionProtocol protocol, FeedReader reader, CancellationToken ct) =>
+            RssWriter writer, IRemoteFetcher fetcher, WebmentionProtocol protocol, FeedReader reader, PostService posts, TimeProvider clock, CancellationToken ct) =>
         {
             PostService.CheckVisible(await PostEndpoints.Get(db, id, ct));
             var refs = await db.References.AsNoTracking().Where(r => r.TargetId == id && r.Kind == "reply" && r.Status == "visible").Take(200).ToListAsync(ct);
@@ -66,14 +66,25 @@ public static class PublicEndpoints
                 {
                     if (++fetches > 20 || budget.IsCancellationRequested) throw new ApiProblem(502, "fetch-budget", "Conversation fetch budget exhausted.");
                     var doc = await fetcher.GetAsync(reference.SourceUrl, budget.Token);
+                    if (doc.Status == 410) await posts.ReverifyAsync(reference, budget.Token);
                     if (doc.Status != 200) throw new ApiProblem(502, "origin-unavailable", "Origin unavailable.");
-                    var evidence = protocol.Extract(doc, reference.SourceUrl, reference.TargetUrl ?? $"{o.BaseUrl}/post/{id}");
+                    var target = reference.TargetUrl ?? $"{o.BaseUrl}/post/{id}";
+                    var evidence = protocol.Extract(doc, reference.SourceUrl, target);
+                    if (evidence.SingletonUrl is { } singleton)
+                    {
+                        if (++fetches > 20) throw new ApiProblem(502, "fetch-budget", "Conversation fetch budget exhausted.");
+                        evidence = protocol.CompareFeed(evidence, await fetcher.GetAsync(singleton, budget.Token), reference.SourceUrl, target, reader);
+                    }
+                    if (!evidence.Backlink || evidence.Status != "supported" || evidence.Kind != "reply"
+                        || reference.ObservedAt < clock.GetUtcNow().UtcDateTime.AddSeconds(-30))
+                        await posts.ReverifyAsync(reference, budget.Token);
                     if (!evidence.Backlink || evidence.Entry is null) throw new ApiProblem(502, "origin-unavailable", "Origin unavailable.");
+                    if (evidence.Status != "supported" || evidence.Kind != "reply")
+                        throw new ApiProblem(502, "ambiguous-identity", "Current source evidence does not verify this reply.");
                     var entry = evidence.Entry with
                     {
-                        Identity = reference.IdentityJson is null ? evidence.Entry.Identity
-                            : System.Text.Json.JsonSerializer.Deserialize<EntryIdentity>(reference.IdentityJson, Wire.Json)!,
-                        CommentsUrl = reference.CommentsUrl, AuthorFeedUrl = reference.AuthorFeedUrl,
+                        CommentsUrl = evidence.Entry.CommentsUrl ?? evidence.CommentsUrl ?? reference.CommentsUrl,
+                        AuthorFeedUrl = evidence.Entry.AuthorFeedUrl ?? evidence.AuthorFeedUrl ?? reference.AuthorFeedUrl,
                         Kind = reference.Kind, SemanticStatus = "supported"
                     };
                     items.Add(writer.Remote(entry));
@@ -116,7 +127,7 @@ public static class PublicEndpoints
         string? handle, Guid? id, CancellationToken ct)
     {
         if (id is not null) PostService.CheckVisible(await PostEndpoints.Get(db, id.Value, ct));
-        var query = db.Posts.Include(p => p.Owner).Where(p => !p.Hidden && p.DeletedAt == null && !p.Owner.Disabled);
+        var query = db.Posts.Include(p => p.Owner).Where(p => !p.Hidden && p.DeletedAt == null);
         if (handle is not null) query = query.Where(p => p.Owner.UserName == handle);
         if (id is not null) query = query.Where(p => p.Id == id);
         var posts = await query.OrderByDescending(p => p.PublishedAt).ThenByDescending(p => p.Id).Take(50).ToListAsync(ct);
@@ -127,6 +138,12 @@ public static class PublicEndpoints
     }
     private static Task<int> Count(AppDbContext db, Guid id, CancellationToken ct) =>
         db.References.CountAsync(r => r.TargetId == id && r.Kind == "reply" && r.Status == "visible", ct);
-    private static async Task<DateTime> Changed(AppDbContext db, CancellationToken ct) =>
-        await db.Changes.MaxAsync(c => (DateTime?)c.At, ct) ?? DateTime.UnixEpoch;
+    private static async Task<DateTime> Changed(AppDbContext db, CancellationToken ct)
+    {
+        var publication = await db.Posts.MaxAsync(p => (DateTime?)p.UpdatedAt, ct) ?? DateTime.UnixEpoch;
+        var reference = await db.References.MaxAsync(r => (DateTime?)r.ObservedAt, ct) ?? DateTime.UnixEpoch;
+        var journal = await db.Changes.Where(c => c.ResourceType == "post" || c.ResourceType == "profile" || c.ResourceType == "interactions")
+            .MaxAsync(c => (DateTime?)c.At, ct) ?? DateTime.UnixEpoch;
+        return new[] { publication, reference, journal }.Max();
+    }
 }

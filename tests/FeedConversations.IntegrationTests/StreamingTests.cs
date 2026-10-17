@@ -11,6 +11,39 @@ namespace FeedConversations.IntegrationTests;
 public sealed class StreamingTests
 {
     [Fact]
+    public async Task GlobalObserverBoundaryAllows99And100ButRejects101AndReleasesAll()
+    {
+        await using var fixture = new ApiFixture();
+        var (client, _, _) = await fixture.LoginAsync();
+        using (client) using (var scope = fixture.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var journal = scope.ServiceProvider.GetRequiredService<ChangeJournal>();
+            var accounts = Enumerable.Range(0, 101).Select(i => new Account { UserName = $"viewer-{i}", SecurityStamp = Guid.NewGuid().ToString() }).ToList();
+            db.Users.AddRange(accounts);
+            ChangeJournal.Add(db, "post", "synthetic-public-resource", 1, "upsert");
+            await db.SaveChangesAsync();
+            var observers = new List<IAsyncEnumerator<System.Net.ServerSentEvents.SseItem<object>>>();
+            try
+            {
+                for (var i = 0; i < 100; i++)
+                {
+                    var observer = journal.Observe(journal.Cursor(0), accounts[i].Id, accounts[i].SecurityStamp,
+                        scope.ServiceProvider.GetRequiredService<IServiceScopeFactory>(), default).GetAsyncEnumerator();
+                    observers.Add(observer);
+                    Assert.True(await observer.MoveNextAsync());
+                    Assert.Equal(i + 1, journal.ActiveObservers);
+                }
+                await using var excess = journal.Observe(journal.Cursor(0), accounts[100].Id, accounts[100].SecurityStamp,
+                    scope.ServiceProvider.GetRequiredService<IServiceScopeFactory>(), default).GetAsyncEnumerator();
+                Assert.Equal("stream-capacity", (await Assert.ThrowsAsync<ApiProblem>(() => excess.MoveNextAsync().AsTask())).Code);
+            }
+            finally { foreach (var observer in observers) await observer.DisposeAsync(); }
+            Assert.Equal(0, journal.ActiveObservers);
+        }
+    }
+
+    [Fact]
     public async Task SnapshotSubscribeRaceAndFanoutReadTheDurableJournalOncePerObserver()
     {
         await using var fixture = new ApiFixture();

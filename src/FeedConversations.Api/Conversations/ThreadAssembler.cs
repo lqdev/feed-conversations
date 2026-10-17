@@ -5,6 +5,7 @@ using FeedConversations.Api.Configuration;
 using FeedConversations.Api.Data;
 using FeedConversations.Api.Infrastructure;
 using FeedConversations.Api.Networking;
+using FeedConversations.Api.Operations;
 using FeedConversations.Api.Posts;
 using FeedConversations.Api.Syndication;
 using FeedConversations.Api.Webmentions;
@@ -16,18 +17,19 @@ public sealed record ThreadNode(EntryIdentity Identity, string Permalink, EntryI
     string Kind, object? Author, object? Publication, string Availability);
 public sealed record ThreadResult(ThreadNode? Root, IReadOnlyList<ThreadNode> Nodes, bool Complete, IReadOnlyList<string> PartialReasons);
 
-public sealed class ThreadAssembler(AppDbContext db, PostService posts, IRemoteFetcher fetcher, FeedReader reader)
+public sealed class ThreadAssembler(AppDbContext db, PostService posts, IRemoteFetcher fetcher, FeedReader reader, TimeProvider clock)
 {
     public async Task<ThreadResult> Assemble(string url, bool hydrate, CancellationToken ct)
     {
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        deadline.CancelAfter(TimeSpan.FromSeconds(10));
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10), clock);
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
         var nodes = new Dictionary<string, ThreadNode>();
         var expanded = new HashSet<string>();
         var path = new HashSet<string>();
         var reasons = new HashSet<string>();
         var remoteEntries = new Dictionary<string, RemoteEntry>();
         var parentUrls = new Dictionary<string, string>();
+        var tombstones = new HashSet<string>();
         var fetches = 0;
         async Task<RemoteDocument?> Fetch(string location)
         {
@@ -38,6 +40,7 @@ public sealed class ThreadAssembler(AppDbContext db, PostService posts, IRemoteF
             try
             {
                 var doc = await fetcher.GetAsync(location, deadline.Token);
+                if (doc.Status == 410) { tombstones.Add(UrlPolicy.Key(location)); return null; }
                 if (doc.Status != 200) { reasons.Add("origin-unavailable"); return null; }
                 return doc;
             }
@@ -81,7 +84,22 @@ public sealed class ThreadAssembler(AppDbContext db, PostService posts, IRemoteF
                             try
                             {
                                 var candidates = reader.Parse(feed.Bytes, feed.FinalUrl).Where(e => UrlPolicy.Key(e.Permalink) == key).ToList();
-                                if (candidates.Count == 1) entry = candidates[0];
+                                if (candidates.Count == 1)
+                                {
+                                    entry = candidates[0];
+                                    var relation = SemanticProfile.HtmlRelation(Encoding.UTF8.GetString(html.Bytes), location, html.FinalUrl);
+                                    if (feed.FinalUrl.GetLeftPart(UriPartial.Authority) != new Uri(location).GetLeftPart(UriPartial.Authority)
+                                        || relation.Ambiguous || relation.Kind is not null && entry.SemanticStatus == "supported"
+                                            && (relation.Kind != entry.Kind || relation.Target is not null && entry.TargetUrl is not null
+                                                && UrlPolicy.Key(relation.Target) != UrlPolicy.Key(entry.TargetUrl)))
+                                        entry = entry with { SemanticStatus = "ambiguous" };
+                                    if (entry.Kind is "reply" or "like" or "bookmark" && entry.TargetUrl is not null)
+                                    {
+                                        var evidence = new WebmentionProtocol().Extract(html, location, entry.TargetUrl);
+                                        if (!evidence.Backlink || evidence.Status == "incomplete")
+                                            entry = entry with { SemanticStatus = evidence.Status == "incomplete" ? "incomplete" : "ambiguous" };
+                                    }
+                                }
                                 else reasons.Add("ambiguous-identity");
                             }
                             catch (ApiProblem) { reasons.Add("ambiguous-identity"); }
@@ -106,7 +124,8 @@ public sealed class ThreadAssembler(AppDbContext db, PostService posts, IRemoteF
                 else
                 {
                     reasons.Add("origin-unavailable");
-                    node = new ThreadNode(new EntryIdentity("permalink", location), location, null, "unknown", null, null, "unavailable");
+                    node = new ThreadNode(new EntryIdentity("permalink", location), location, null, "unknown", null, null,
+                        tombstones.Contains(key) ? "tombstone" : "unavailable");
                 }
             }
             nodes[key] = node;
@@ -190,6 +209,8 @@ public sealed class ThreadAssembler(AppDbContext db, PostService posts, IRemoteF
             if (!ancestors.Add(root.Identity.Key)) { reasons.Add("cycle"); break; }
             root = next;
         }
+        foreach (var reason in reasons)
+            OperationMetrics.ThreadPartials.Add(1, new KeyValuePair<string, object?>("reason", reason));
         return new ThreadResult(root, nodes.Values.ToList(), reasons.Count == 0, reasons.ToList());
     }
 }

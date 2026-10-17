@@ -7,6 +7,7 @@ using FeedConversations.Api.Accounts;
 using FeedConversations.Api.Configuration;
 using FeedConversations.Api.Data;
 using FeedConversations.Api.Infrastructure;
+using FeedConversations.Api.Operations;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.EntityFrameworkCore;
 
@@ -58,6 +59,7 @@ public sealed class ChangeJournal(InstanceOptions options, IDataProtectionProvid
             if (observers.Count >= 100 || observers.Values.Count(o => o.Owner == owner) >= 3)
                 throw new ApiProblem(503, "stream-capacity", "The stream capacity is exhausted.");
             observers[id] = (owner, channel);
+            OperationMetrics.Observers.Add(1);
         }
         try
         {
@@ -70,6 +72,7 @@ public sealed class ChangeJournal(InstanceOptions options, IDataProtectionProvid
                 var reason = Validate(after, low, high, out sequence);
                 if (reason is not null)
                 {
+                    OperationMetrics.Resets.Add(1, new KeyValuePair<string, object?>("reason", reason));
                     yield return new SseItem<object>(new { reason }, "reset-required");
                     yield break;
                 }
@@ -84,11 +87,13 @@ public sealed class ChangeJournal(InstanceOptions options, IDataProtectionProvid
                 var low = await db.Changes.MinAsync(c => (long?)c.Sequence, token) ?? await HighWater(db, token) + 1;
                 if (sequence < Math.Max(0, low - 1))
                 {
+                    OperationMetrics.Resets.Add(1, new KeyValuePair<string, object?>("reason", "slow-consumer"));
                     yield return new SseItem<object>(new { reason = "slow-consumer" }, "reset-required");
                     yield break;
                 }
                 var batch = await db.Changes.AsNoTracking().Where(c => c.Sequence > sequence)
                     .OrderBy(c => c.Sequence).Take(100).ToListAsync(token);
+                OperationMetrics.JournalLag.Record(Math.Max(0, await HighWater(db, token) - sequence));
                 foreach (var change in batch)
                 {
                     sequence = change.Sequence;
@@ -110,6 +115,10 @@ public sealed class ChangeJournal(InstanceOptions options, IDataProtectionProvid
                 catch (OperationCanceledException) when (!token.IsCancellationRequested) { }
             }
         }
-        finally { observers.TryRemove(id, out _); channel.Writer.TryComplete(); }
+        finally
+        {
+            if (observers.TryRemove(id, out _)) OperationMetrics.Observers.Add(-1);
+            channel.Writer.TryComplete();
+        }
     }
 }

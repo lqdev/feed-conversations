@@ -1,6 +1,6 @@
 import DOMPurify from "dompurify";
 import { combineLatest, Subscription as RxSubscription } from "rxjs";
-import { ApiClient, ApiError, type Account, type Connection, type CreatePostCommand, type Post, type Relationship, type ViewDefinition } from "./api/client";
+import { ApiClient, ApiError, commandWasRejected, type Account, type Connection, type CreatePostCommand, type Post, type Relationship, type ViewDefinition } from "./api/client";
 import { InstanceSession, localView } from "./sessions/InstanceSession";
 import { evaluate, localEntry, remoteEntries, type TimelineEntry } from "./views/evaluator";
 import "./styles.css";
@@ -12,6 +12,7 @@ let selected: Connection;
 let generation = 0;
 let pendingKey = crypto.randomUUID();
 let pendingRelationship: Relationship | null = null;
+let loginLifetime: AbortController | null = null;
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, text?: string): HTMLElementTagNameMap[K] {
   const node = document.createElement(tag);
@@ -25,6 +26,12 @@ function link(text: string, url: string): HTMLAnchorElement {
   node.href = parsed.href;
   node.rel = "noopener noreferrer";
   node.target = "_blank";
+  return node;
+}
+function content(html: string | null): HTMLDivElement {
+  const node = el("div"); node.className = "content";
+  node.innerHTML = DOMPurify.sanitize(html ?? "", { FORBID_TAGS: ["img", "video", "audio", "iframe", "style", "form"],
+    FORBID_ATTR: ["style", "class", "id"], ADD_ATTR: ["target"] });
   return node;
 }
 function button(text: string, action: () => void | Promise<void>): HTMLButtonElement {
@@ -58,10 +65,12 @@ function submit(form: HTMLFormElement, text: string, action: () => Promise<void>
   form.addEventListener("submit", event => { event.preventDefault(); void run(node, action); });
 }
 function session(): InstanceSession { if (!current) throw new Error("Log in first."); return current; }
-function stop(): void { generation++; current?.dispose(); current = null; uiSubscriptions.unsubscribe(); uiSubscriptions = new RxSubscription(); pendingRelationship = null; pendingKey = crypto.randomUUID(); }
+function stop(): void { generation++; loginLifetime?.abort(); loginLifetime = null; current?.dispose(); current = null; uiSubscriptions.unsubscribe(); uiSubscriptions = new RxSubscription(); pendingRelationship = null; pendingKey = crypto.randomUUID(); }
 
 function loginPage(connections: Connection[]): void {
   stop();
+  loginLifetime = new AbortController();
+  const clients = new Map(connections.map(connection => [connection.id, new ApiClient(connection, loginLifetime!.signal)]));
   root.replaceChildren(el("h1", "Feed conversations"), alert, status);
   status.textContent = "Invite-only accounts. Publications, likes, and bookmarks are public.";
   const selector = el("select"); selector.setAttribute("aria-label", "Connection");
@@ -77,7 +86,7 @@ function loginPage(connections: Connection[]): void {
   submit(login, "Log in", async () => {
     const captured = generation;
     const connection = selected;
-    const api = new ApiClient(connection, new AbortController().signal);
+    const api = clients.get(connection.id)!;
     await api.token();
     const result = await api.command<Account>("/auth/login", { handle: handle.value, password: password.value });
     password.value = "";
@@ -90,7 +99,7 @@ function loginPage(connections: Connection[]): void {
   const newPassword = field(invite, "password", "New password (12+ characters)", "password");
   submit(invite, "Create account", async () => {
     const captured = generation; const connection = selected;
-    const api = new ApiClient(connection, new AbortController().signal);
+    const api = clients.get(connection.id)!;
     await api.token();
     const result = await api.command<Account>("/auth/redeem-invite", { code: code.value, handle: newHandle.value, password: newPassword.value, displayName: newHandle.value });
     newPassword.value = ""; code.value = "";
@@ -130,6 +139,7 @@ async function workspace(connection: Connection, account: Account, connections: 
   const target = field(composer, "target", "Target permalink (required for relations)", "url");
   const title = field(composer, "title", "Optional authored title");
   const markdown = textarea(composer, "markdown", "Your Markdown");
+  let pendingPublication: { command: CreatePostCommand; key: string } | null = null;
   kind.onchange = () => {
     title.disabled = markdown.disabled = kind.value === "like";
     if (kind.value === "post") pendingRelationship = null;
@@ -143,9 +153,25 @@ async function workspace(connection: Connection, account: Account, connections: 
       title: kind.value === "like" || !title.value ? null : title.value,
       markdown: kind.value === "like" || !markdown.value ? null : markdown.value, relationship: relation,
     };
-    const result = await active.api.command<{ post: Post; delivery: { state: string } }>("/posts", command, "POST", undefined, pendingKey);
+    const intent = pendingPublication ?? { command, key: pendingKey };
+    pendingPublication = intent;
+    for (const control of [kind, target, title, markdown]) control.disabled = true;
+    let result;
+    try {
+      result = await active.api.command<{ post: Post; delivery: { state: string } }>("/posts", intent.command, "POST", undefined, intent.key);
+    } catch (error) {
+      if (commandWasRejected(error)) {
+        pendingPublication = null;
+        pendingKey = crypto.randomUUID();
+        kind.disabled = target.disabled = false;
+        title.disabled = markdown.disabled = kind.value === "like";
+        throw error;
+      }
+      throw new Error("Publication outcome is uncertain. Retry submits the identical intent; do not create a replacement until reconciled.", { cause: error });
+    }
+    pendingPublication = null;
     pendingKey = crypto.randomUUID(); pendingRelationship = null; markdown.value = title.value = target.value = "";
-    kind.value = "post"; title.disabled = markdown.disabled = false;
+    kind.value = "post"; kind.disabled = target.disabled = title.disabled = markdown.disabled = false;
     status.textContent = `Published. Delivery: ${result.value.delivery.state}.`;
     active.invalidate();
   });
@@ -160,6 +186,7 @@ async function workspace(connection: Connection, account: Account, connections: 
     active.selectedView.next(definition);
   };
   function chooseReply(entry: TimelineEntry, relationKind: "reply" | "like" | "bookmark"): void {
+    if (pendingPublication) throw new Error("Retry the pending publication before starting another intent.");
     kind.value = relationKind; target.value = entry.permalink;
     const identity = entry.remote?.identity;
     pendingRelationship = { kind: relationKind, target: { permalink: entry.permalink,
@@ -176,22 +203,20 @@ async function workspace(connection: Connection, account: Account, connections: 
     article.append(el("p", `${entry.label} · ${entry.kind} · ${entry.publishedAt}`));
     if (entry.title) article.append(el("h3", entry.title));
     if (entry.targetUrl) article.append(link(`${entry.kind === "reply" ? "Reply to" : entry.kind === "like" ? "Liked" : "Bookmarked"} target`, entry.targetUrl));
-    const body = el("div"); body.className = "content";
-    body.innerHTML = DOMPurify.sanitize(entry.html, { FORBID_TAGS: ["img", "video", "audio", "iframe", "style", "form"],
-      FORBID_ATTR: ["style", "class", "id"], ADD_ATTR: ["target"] });
-    article.append(body, link("Permalink", entry.permalink));
+    article.append(content(entry.html), link("Permalink", entry.permalink));
     const actions = el("div"); actions.className = "actions";
     actions.append(button("Reply", () => chooseReply(entry, "reply")), button("Like publicly", () => chooseReply(entry, "like")),
       button("Bookmark publicly", () => chooseReply(entry, "bookmark")), button("Open thread", () => showThread(entry.permalink)));
     if (entry.local?.author.id === account.id) {
       const own = entry.local;
       actions.append(button("Edit", async () => {
+        const latest = await active.api.get<Post>(`/posts/${own.id}`);
+        if (!latest.etag) throw new Error("Publication revision is unavailable.");
         const editor = el("form");
-        const newTitle = field(editor, "title", "Edit title", "text", own.title ?? "");
-        const newMarkdown = textarea(editor, "markdown", "Edit Markdown", own.markdown ?? "");
+        const newTitle = field(editor, "title", "Edit title", "text", latest.value.title ?? "");
+        const newMarkdown = textarea(editor, "markdown", "Edit Markdown", latest.value.markdown ?? "");
         if (own.kind === "like") { newTitle.disabled = true; newMarkdown.disabled = true; }
         submit(editor, "Save changes", async () => {
-          const latest = await active.api.get<Post>(`/posts/${own.id}`);
           await active.api.command(`/posts/${own.id}`, { title: newTitle.value || null, markdown: newMarkdown.value || null }, "PATCH", latest.etag ?? undefined);
           editor.remove(); active.invalidate();
         });
@@ -218,7 +243,7 @@ async function workspace(connection: Connection, account: Account, connections: 
   const addSource = el("form");
   const sourceUrl = field(addSource, "url", "Feed URL", "url");
   const label = field(addSource, "label", "Feed label");
-  submit(addSource, "Subscribe", async () => { await active.api.command("/subscriptions", { url: sourceUrl.value, label: label.value, group: null }, "POST", undefined, crypto.randomUUID()); active.invalidate(); });
+  submit(addSource, "Subscribe", async () => { await active.api.command("/subscriptions", { url: sourceUrl.value, label: label.value, group: null }); active.invalidate(); });
   const opml = el("form"); const opmlText = textarea(opml, "opml", "OPML text");
   const opmlSelection = el("div");
   let selectedUrls: string[] = [];
@@ -232,14 +257,14 @@ async function workspace(connection: Connection, account: Account, connections: 
     }));
   });
   opml.append(opmlSelection, button("Import selected subscriptions", async () => {
-    const result = await active.api.command<{ imported: number }>("/opml/import", { text: opmlText.value, selectedUrls }, "POST", undefined, crypto.randomUUID());
+    const result = await active.api.command<{ imported: number }>("/opml/import", { text: opmlText.value, selectedUrls });
     status.textContent = `Imported ${result.value.imported} subscriptions. No feed retrieval was started.`; active.invalidate();
   }));
   const exportOpml = el("a", "Export private subscription OPML"); exportOpml.href = `${connection.prefix}/api/v1/opml/export`;
   subscriptions.append(addSource, opml, exportOpml);
   const viewsList = el("div"); const viewForm = el("form");
   const definition = textarea(viewForm, "definition", "Declarative view JSON", JSON.stringify(localView, null, 2));
-  submit(viewForm, "Create view", async () => { await active.api.command("/views", JSON.parse(definition.value) as ViewDefinition, "POST", undefined, crypto.randomUUID()); active.invalidate(); });
+  submit(viewForm, "Create view", async () => { await active.api.command("/views", JSON.parse(definition.value) as ViewDefinition); active.invalidate(); });
   views.append(viewsList, viewForm);
   uiSubscriptions.add(active.snapshot.subscribe(snapshot => {
     const previous = viewSelect.value;
@@ -268,10 +293,16 @@ async function workspace(connection: Connection, account: Account, connections: 
     for (const [name, node] of pages) node.hidden = name !== "Thread";
     active.viewObserved.next(false);
     threadUrl.value = url;
-    const result = await active.api.get<{ complete: boolean; partialReasons: string[]; nodes: { permalink: string; kind: string; availability: string; parentIdentity: { value: string } | null }[] }>(`/thread?url=${encodeURIComponent(url)}`);
+    const result = await active.api.get<{ complete: boolean; partialReasons: string[]; nodes: {
+      permalink: string; kind: string; availability: string; parentIdentity: { value: string; feedUrl?: string; guid?: string } | null;
+      publication: { title: string | null; html: string | null } | null;
+    }[] }>(`/thread?url=${encodeURIComponent(url)}`);
     threadOutput.replaceChildren(el("p", `Known-input completeness: ${result.value.complete}; ${result.value.partialReasons.join(", ")}`),
       ...result.value.nodes.map(node => {
-        const row = el("article", `${node.kind}: ${node.availability}${node.parentIdentity ? `; parent ${node.parentIdentity.value}` : ""} `);
+        const parent = node.parentIdentity;
+        const row = el("article", `${node.kind}: ${node.availability}${parent ? `; parent ${parent.guid ? `${parent.feedUrl} · ${parent.guid}` : parent.value}` : ""} `);
+        if (node.publication?.title) row.append(el("h3", node.publication.title));
+        if (node.publication?.html) row.append(content(node.publication.html));
         row.append(link("Origin publication", node.permalink)); return row;
       }));
   }
@@ -322,7 +353,10 @@ async function workspace(connection: Connection, account: Account, connections: 
     }));
   if (admin) {
     const inviteOutput = el("pre");
-    admin.append(button("Create one-use invite", async () => { const result = await active.api.command<{ code: string }>("/admin/invites"); inviteOutput.textContent = result.value.code; }), inviteOutput);
+    admin.append(button("Create one-use invite", async () => {
+      const result = await active.api.command<{ code: string | null }>("/admin/invites");
+      inviteOutput.textContent = result.value.code ?? "The earlier invite was created, but its one-time code cannot be recovered. A separate intent can issue another.";
+    }), inviteOutput);
     const accountForm = el("form"); const accountId = field(accountForm, "id", "Account ID to disable/enable");
     accountForm.append(button("Disable account", async () => { await active.api.command(`/admin/accounts/${encodeURIComponent(accountId.value)}/disable`); status.textContent = "Account disabled."; }),
       button("Enable account", async () => { await active.api.command(`/admin/accounts/${encodeURIComponent(accountId.value)}/enable`); status.textContent = "Account enabled."; }));
