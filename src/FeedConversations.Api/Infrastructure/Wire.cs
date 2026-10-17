@@ -9,7 +9,8 @@ public static class Wire
 {
     public static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web)
     {
-        UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow
+        UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
+        RespectNullableAnnotations = true
     };
     public static string Hash(string text) => Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(text)));
     public static string ETag(string type, string id, int revision) => $"\"{Hash($"{type}:{id}:{revision}")}\"";

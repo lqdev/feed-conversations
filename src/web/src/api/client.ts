@@ -3,6 +3,7 @@ export interface Account { id: string; handle: string; displayName: string; bio:
 export type Kind = "post" | "reply" | "like" | "bookmark";
 export type TargetIdentity = { kind: "permalink"; value: string } | { kind: "feed-guid"; feedUrl: string; guid: string };
 export interface Relationship { kind: Exclude<Kind, "post">; target: { permalink: string; identity: TargetIdentity } }
+export type CreatePostCommand = Omit<components["schemas"]["CreatePost"], "relationship"> & { relationship: Relationship | null };
 export interface Post {
   id: string; guid: string; permalink: string; author: { id: string; handle: string; displayName: string };
   publishedAt: string; updatedAt: string; revision: number; kind: Kind; title: string | null;
@@ -41,7 +42,7 @@ export class ApiClient {
   command<T>(path: string, body?: unknown, method = "POST", etag?: string, key?: string) {
     return this.request<T>(path, method, body, etag, key);
   }
-  async request<T>(path: string, method = "GET", body?: unknown, etag?: string, key?: string): Promise<{ value: T; etag: string | null }> {
+  async request<T>(path: string, method = "GET", body?: unknown, etag?: string, key?: string, signal?: AbortSignal): Promise<{ value: T; etag: string | null }> {
     const headers = new Headers();
     if (method !== "GET") headers.set("X-CSRF-TOKEN", this.csrf);
     if (etag) headers.set("If-Match", etag);
@@ -49,7 +50,7 @@ export class ApiClient {
     const raw = body instanceof Blob;
     if (body !== undefined) headers.set("Content-Type", raw ? "application/zip" : "application/json");
     const response = await fetch(`${this.connection.prefix}/api/v1${path}`, {
-      method, credentials: "same-origin", cache: "no-store", headers, signal: this.lifetime,
+      method, credentials: "same-origin", cache: "no-store", headers, signal: signal ? AbortSignal.any([this.lifetime, signal]) : this.lifetime,
       body: body === undefined ? undefined : raw ? body : JSON.stringify(body),
     });
     if (!response.ok) {
@@ -77,3 +78,4 @@ export class ApiClient {
     return response.json() as Promise<{ checksum: string; new: number; unchanged: number; conflicts: number; alreadyImported: boolean }>;
   }
 }
+import type { components } from "./generated";

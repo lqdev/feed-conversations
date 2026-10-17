@@ -18,7 +18,7 @@ public interface IRemoteFetcher
     Task<RemoteDocument> PostAsync(string url, string source, string target, CancellationToken token);
 }
 
-public sealed class SafeRemoteFetcher(InstanceOptions options, TimeProvider clock) : IRemoteFetcher, IDisposable
+public sealed class SafeRemoteFetcher(InstanceOptions options, TimeProvider clock, IAddressResolver resolver, IRemoteConnector connector) : IRemoteFetcher, IDisposable
 {
     private readonly SemaphoreSlim global = new(4, 4);
     private readonly object gate = new();
@@ -105,6 +105,7 @@ public sealed class SafeRemoteFetcher(InstanceOptions options, TimeProvider cloc
             try
             {
                 var current = UrlPolicy.Parse(url);
+                var unconditionalRetry = false;
                 for (var redirects = 0; ; redirects++)
                 {
                     var origin = current.GetLeftPart(UriPartial.Authority);
@@ -150,12 +151,20 @@ public sealed class SafeRemoteFetcher(InstanceOptions options, TimeProvider cloc
                             }
                             using var request = new HttpRequestMessage(source is null ? HttpMethod.Get : HttpMethod.Post, current);
                             request.Headers.UserAgent.ParseAdd("FeedConversations/0.1");
+                            if (unconditionalRetry) request.Headers.CacheControl = new System.Net.Http.Headers.CacheControlHeaderValue { NoCache = true };
                             request.Headers.Accept.ParseAdd("application/rss+xml, application/atom+xml, application/xml, text/xml, text/html");
                             if (source is not null)
                                 request.Content = new FormUrlEncodedContent(new Dictionary<string, string>
                                 { ["source"] = source, ["target"] = target! });
                             using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, deadline.Token);
                             var status = (int)response.StatusCode;
+                            if (status == 304 && source is null)
+                            {
+                                if (unconditionalRetry) throw new ApiProblem(502, "invalid-304", "Origin returned 304 without a retained conditional representation.");
+                                unconditionalRetry = true;
+                                redirects--;
+                                continue;
+                            }
                             if (status is 301 or 302 or 303 or 307 or 308)
                             {
                                 if (redirects >= 3 || response.Headers.Location is null
@@ -212,18 +221,12 @@ public sealed class SafeRemoteFetcher(InstanceOptions options, TimeProvider cloc
 
     private async ValueTask<Stream> ConnectAsync(DnsEndPoint destination, string origin, CancellationToken token)
     {
-        var addresses = await Dns.GetHostAddressesAsync(destination.Host, token);
+        var addresses = await resolver.ResolveAsync(destination.Host, token);
         var developmentAllowed = options.DevelopmentOrigins.Contains(origin, StringComparer.Ordinal);
         if (addresses.Length == 0 || !developmentAllowed && addresses.Any(a => !UrlPolicy.PublicAddress(a)))
             throw new ApiProblem(502, "destination-blocked", "Remote destination is not public.");
         // The socket uses the address validated here, never a subsequent DNS lookup.
-        var socket = new Socket(SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
-        try
-        {
-            await socket.ConnectAsync(new IPEndPoint(addresses[0], destination.Port), token);
-            return new NetworkStream(socket, ownsSocket: true);
-        }
-        catch { socket.Dispose(); throw; }
+        return await connector.ConnectAsync(new IPEndPoint(addresses[0], destination.Port), token);
     }
 
     public void Dispose() => global.Dispose();

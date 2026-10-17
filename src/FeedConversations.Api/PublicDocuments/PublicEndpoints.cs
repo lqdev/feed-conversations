@@ -24,7 +24,7 @@ public static class PublicEndpoints
             var body = PublicationHtml.Entry(post, o.BaseUrl)
                 + $"<p><a href=\"{post.Permalink}/comments.xml\">Known direct replies</a></p>";
             return Conditional(ctx, PublicationHtml.Page(post.Title ?? RssWriter.Type(post.Kind), body, o.BaseUrl,
-                post.Permalink, post.Permalink + "/rss.xml"), "text/html");
+                post.Permalink, post.Permalink + "/rss.xml", $"{o.BaseUrl}/users/{post.Owner.UserName}/rss.xml"), "text/html");
         });
         app.MapGet("/users/{handle}", async (string handle, HttpContext ctx, AppDbContext db, InstanceOptions o, CancellationToken ct) =>
         {

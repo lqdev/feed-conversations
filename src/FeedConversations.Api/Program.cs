@@ -20,6 +20,7 @@ using Microsoft.AspNetCore.Antiforgery;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.RateLimiting;
+using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -28,6 +29,14 @@ var instance = builder.Configuration.GetSection("Instance").Get<InstanceOptions>
 instance.Validate(builder.Environment.IsDevelopment());
 Directory.CreateDirectory(instance.DataDirectory);
 builder.Services.AddSingleton(instance);
+builder.Services.Configure<ForwardedHeadersOptions>(options =>
+{
+    options.ForwardedHeaders = ForwardedHeaders.XForwardedProto | ForwardedHeaders.XForwardedFor;
+    options.ForwardLimit = 1;
+    options.KnownProxies.Clear();
+    options.KnownIPNetworks.Clear();
+    foreach (var proxy in instance.TrustedProxies) options.KnownProxies.Add(System.Net.IPAddress.Parse(proxy));
+});
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddDbContext<AppDbContext>(options => options.UseSqlite(
     $"Data Source={Path.Combine(instance.DataDirectory, "app.db")};Foreign Keys=True;Default Timeout=5"));
@@ -57,6 +66,7 @@ builder.Services.ConfigureApplicationCookie(options =>
     };
 });
 builder.Services.AddAuthorization();
+builder.Services.AddSingleton<LoginAttempts>();
 builder.Services.AddAntiforgery(options =>
 {
     options.HeaderName = "X-CSRF-TOKEN";
@@ -65,12 +75,18 @@ builder.Services.AddAntiforgery(options =>
     options.Cookie.SecurePolicy = CookieSecurePolicy.Always;
     options.Cookie.SameSite = SameSiteMode.Lax;
 });
-builder.Services.ConfigureHttpJsonOptions(options => options.SerializerOptions.UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow);
+builder.Services.ConfigureHttpJsonOptions(options =>
+{
+    options.SerializerOptions.UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow;
+    options.SerializerOptions.RespectNullableAnnotations = true;
+});
 builder.Services.AddProblemDetails();
 builder.Services.AddExceptionHandler<ProblemHandler>();
 builder.Services.AddValidation();
 builder.Services.AddOpenApi();
 builder.Services.AddSingleton<IRemoteFetcher, SafeRemoteFetcher>();
+builder.Services.AddSingleton<IAddressResolver, SystemAddressResolver>();
+builder.Services.AddSingleton<IRemoteConnector, SocketRemoteConnector>();
 builder.Services.AddSingleton<FeedReader>();
 builder.Services.AddSingleton<ChangeJournal>();
 builder.Services.AddScoped<PostService>();
@@ -119,6 +135,7 @@ using (var scope = app.Services.CreateScope())
 }
 if (BackupCommands.Run(instance, args) || await AdminCommands.RunAsync(app, args)) return;
 app.UseExceptionHandler();
+if (instance.TrustedProxies.Length != 0) app.UseForwardedHeaders();
 app.UseAuthentication();
 app.UseAuthorization();
 app.UseRateLimiter();

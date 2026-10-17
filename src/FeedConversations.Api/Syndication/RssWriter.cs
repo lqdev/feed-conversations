@@ -23,6 +23,7 @@ public sealed class RssWriter
                 new XAttribute("feedUrl", $"{p.Permalink}/comments.xml")),
             new XElement("description", PublicationHtml.Entry(p, baseUrl)));
         if (p.Guid != p.Permalink) item.Element("guid")!.SetAttributeValue("isPermaLink", "false");
+        if (p.Provenance is not null) item.SetAttributeValue(SemanticProfile.Provenance + "authority", "unverified-restore");
         if (p.Title is not null) item.Add(new XElement("title", p.Title));
         if (p.TargetUrl is not null)
         {
@@ -56,7 +57,8 @@ public sealed class RssWriter
         if (entry.UpdatedAt is { } updated) item.Add(new XElement(SemanticProfile.Atom + "updated", updated.ToString("O")));
         if (entry.SemanticStatus == "supported")
         {
-            item.Add(new XElement(SemanticProfile.Atom + "category", new XAttribute("term", SemanticProfile.Schema + Type(entry.Kind))));
+            item.Add(new XElement(SemanticProfile.Atom + "category", new XAttribute("term",
+                entry.SemanticType == SemanticProfile.Schema + "BlogPosting" ? entry.SemanticType : SemanticProfile.Schema + Type(entry.Kind))));
             if (entry.AuthorUrl is not null) item.Add(new XElement(SemanticProfile.Atom + "link",
                 new XAttribute("rel", SemanticProfile.Schema + (entry.Kind is "like" or "bookmark" ? "agent" : "author")), new XAttribute("href", entry.AuthorUrl)));
             if (entry.TargetUrl is not null) item.Add(new XElement(SemanticProfile.Atom + "link",
@@ -64,6 +66,7 @@ public sealed class RssWriter
         }
         if (entry.CommentsUrl is not null) item.Add(new XElement(SemanticProfile.Source + "comments", new XAttribute("feedUrl", entry.CommentsUrl)));
         if (entry.AuthorFeedUrl is not null) item.Add(new XElement("source", new XAttribute("url", entry.AuthorFeedUrl), "Origin author"));
+        if (!entry.OriginAuthority) item.SetAttributeValue(SemanticProfile.Provenance + "authority", "unverified-restore");
         return item;
     }
     public string Write(string title, string page, string self, DateTime changedAt, IEnumerable<XElement> items) =>

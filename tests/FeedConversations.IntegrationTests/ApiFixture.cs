@@ -20,7 +20,10 @@ public sealed class ApiFixture : WebApplicationFactory<Program>
 {
     private readonly string suffix;
     private readonly IRemoteFetcher? remote;
-    public ApiFixture(string suffix = "a", IRemoteFetcher? remote = null) { this.suffix = suffix; this.remote = remote; }
+    private readonly TimeProvider? clock;
+    private readonly Dictionary<string, string> passwords = [];
+    public ApiFixture(string suffix = "a", IRemoteFetcher? remote = null, TimeProvider? clock = null)
+    { this.suffix = suffix; this.remote = remote; this.clock = clock; }
     private readonly string directory = Path.Combine(FindRoot(), ".runtime", "integration-" + Guid.NewGuid().ToString("N"));
     protected override IHost CreateHost(IHostBuilder builder)
     {
@@ -39,11 +42,13 @@ public sealed class ApiFixture : WebApplicationFactory<Program>
             && d.ImplementationType is { } implementation && (implementation == typeof(MentionWorker) || implementation == typeof(MaintenanceWorker))).ToList();
         foreach (var worker in workers) services.Remove(worker);
         if (remote is not null) { services.RemoveAll<IRemoteFetcher>(); services.AddSingleton(remote); }
+        if (clock is not null) { services.RemoveAll<TimeProvider>(); services.AddSingleton(clock); }
     });
     public async Task<(HttpClient Client, string Csrf, Account Account)> LoginAsync(string handle = "alice")
     {
         var client = CreateClient(new WebApplicationFactoryClientOptions { BaseAddress = new Uri($"https://{suffix}.example"), HandleCookies = false, AllowAutoRedirect = false });
         var password = "Test-" + Convert.ToHexString(RandomNumberGenerator.GetBytes(24)) + "!a9";
+        passwords[handle] = password;
         Account account;
         using (var scope = Services.CreateScope())
         {
@@ -65,6 +70,17 @@ public sealed class ApiFixture : WebApplicationFactory<Program>
         client.DefaultRequestHeaders.Remove("X-CSRF-TOKEN");
         client.DefaultRequestHeaders.Add("X-CSRF-TOKEN", csrf);
         return (client, csrf, account);
+    }
+    public async Task ConfirmAsync(HttpClient client, string handle)
+    {
+        var response = await client.PostAsJsonAsync("/api/v1/auth/confirm-password", new { password = passwords[handle], newPassword = (string?)null });
+        Assert.True(response.IsSuccessStatusCode, await response.Content.ReadAsStringAsync());
+        AddCookies(client, response);
+        var csrfResponse = await client.GetAsync("/api/v1/auth/csrf");
+        AddCookies(client, csrfResponse);
+        var csrf = (await csrfResponse.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("token").GetString()!;
+        client.DefaultRequestHeaders.Remove("X-CSRF-TOKEN");
+        client.DefaultRequestHeaders.Add("X-CSRF-TOKEN", csrf);
     }
     public static void AddCookies(HttpClient client, HttpResponseMessage response)
     {

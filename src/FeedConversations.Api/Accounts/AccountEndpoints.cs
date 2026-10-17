@@ -43,15 +43,17 @@ public static partial class AccountEndpoints
             return Results.Ok(new { token = anti.GetAndStoreTokens(ctx).RequestToken });
         });
         api.MapPost("/auth/login", async (LoginRequest request, SignInManager<Account> signin,
-            UserManager<Account> users, HttpContext ctx) =>
+            UserManager<Account> users, HttpContext ctx, LoginAttempts attempts) =>
         {
+            if (request.Handle.Length > 64 || request.Password.Length > 1024) throw ApiProblem.Invalid("login-input-limit");
+            attempts.Check(request.Handle, ctx);
             var account = await users.FindByNameAsync(request.Handle);
             if (account is null || account.Disabled)
                 throw new ApiProblem(401, "login-failed", "Login failed.");
             var result = await signin.PasswordSignInAsync(account, request.Password, false, true);
             if (!result.Succeeded) throw new ApiProblem(401, "login-failed", "Login failed.");
             return Results.Ok(Profile(account));
-        }).RequireRateLimiting("login");
+        });
         api.MapPost("/auth/logout", async (SignInManager<Account> signin) =>
         {
             await signin.SignOutAsync();
@@ -61,6 +63,7 @@ public static partial class AccountEndpoints
             UserManager<Account> users, SignInManager<Account> signin, TimeProvider clock, CancellationToken ct) =>
         {
             if (!Handle().IsMatch(request.Handle) || request.Code.Length > 200) throw ApiProblem.Invalid("invalid-handle-or-code");
+            Syndication.SemanticProfile.ValidateText(request.DisplayName, 800, "display-name-too-long");
             await using var tx = await db.Database.BeginTransactionAsync(ct);
             var hash = Wire.Hash(request.Code);
             var invite = await db.Invites.SingleOrDefaultAsync(i => i.TokenHash == hash, ct);
@@ -86,6 +89,8 @@ public static partial class AccountEndpoints
             var account = await Current(ctx, db, ct);
             Wire.CheckMatch(ctx.Request, "account", account.Id, account.Revision);
             if (patch.DisplayName is { Length: > 200 } || patch.Bio is { Length: > 4000 }) throw ApiProblem.Invalid();
+            Syndication.SemanticProfile.ValidateText(patch.DisplayName, 800, "display-name-too-long");
+            Syndication.SemanticProfile.ValidateText(patch.Bio, 16000, "bio-too-long");
             if (patch.DisplayName is not null) account.DisplayName = patch.DisplayName;
             if (patch.Bio is not null) account.Bio = patch.Bio;
             if (patch.DirectoryVisible is not null) account.DirectoryVisible = patch.DirectoryVisible.Value;

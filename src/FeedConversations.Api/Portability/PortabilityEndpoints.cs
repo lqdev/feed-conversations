@@ -18,7 +18,7 @@ public static class PortabilityEndpoints
     {
         var api = app.MapGroup("/api/v1").RequireAuthorization();
         api.MapGet("/export", async (HttpContext ctx, AppDbContext db, InstanceOptions o,
-            ArchiveCodec codec, ChangeJournal journal, CancellationToken ct) =>
+            ArchiveCodec codec, CancellationToken ct) =>
         {
             Confirmed(ctx);
             var owner = await AccountEndpoints.Current(ctx, db, ct);
@@ -29,7 +29,7 @@ public static class PortabilityEndpoints
             var views = await db.Views.Where(v => v.OwnerId == owner.Id).ToListAsync(ct);
             var sequence = await ChangeJournal.HighWater(db, ct);
             var archive = new AccountArchive(new ArchiveManifest(1, Guid.NewGuid().ToString(), o.Id, owner.Id, o.BaseUrl,
-                journal.Cursor(sequence), posts.Count, []),
+                $"local-sequence:{sequence}", posts.Count, []),
                 new ArchiveProfile(owner.DisplayName, owner.Bio, owner.DirectoryVisible),
                 posts.Select(p => new ArchivePost(p.Guid, p.Permalink, p.PublishedAt, p.UpdatedAt, p.Revision, p.Kind, p.Title, p.Markdown,
                     p.TargetUrl is null ? null : new Relationship(p.Kind, new TargetReference(p.TargetUrl,

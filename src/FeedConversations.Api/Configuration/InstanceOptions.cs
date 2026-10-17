@@ -12,6 +12,7 @@ public sealed partial class InstanceOptions
     public string[] DevelopmentOrigins { get; set; } = [];
     public string[] TrustedOrigins { get; set; } = [];
     public string? DevelopmentCaFile { get; set; }
+    public string[] TrustedProxies { get; set; } = [];
     public string BaseUrl => PublicBaseUrl.TrimEnd('/');
 
     public void Validate(bool development)
@@ -29,6 +30,8 @@ public sealed partial class InstanceOptions
                 || candidate.GetLeftPart(UriPartial.Authority) != origin
                 || candidate.Scheme is not ("http" or "https") || candidate.UserInfo.Length != 0)
                 throw new InvalidOperationException("Origins must be exact HTTP(S) origins, including non-default ports.");
+        if (TrustedProxies.Any(proxy => !System.Net.IPAddress.TryParse(proxy, out _)))
+            throw new InvalidOperationException("Trusted proxies must be explicit IP addresses.");
     }
 
     [GeneratedRegex("^[a-z0-9-]{1,64}$")]

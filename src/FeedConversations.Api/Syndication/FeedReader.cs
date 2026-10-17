@@ -24,7 +24,10 @@ public sealed class FeedReader
         var baseUrl = documentUrl;
         foreach (var ancestor in item.AncestorsAndSelf().Reverse())
             if ((string?)ancestor.Attribute(XNamespace.Xml + "base") is { } xmlBase)
-                baseUrl = new Uri(baseUrl, xmlBase);
+            {
+                if (!Uri.TryCreate(baseUrl, xmlBase, out var resolvedBase)) throw ApiProblem.Invalid("invalid-xml-base");
+                baseUrl = resolvedBase;
+            }
         string? Resolve(string? value)
         {
             if (string.IsNullOrWhiteSpace(value)) return null;
@@ -38,6 +41,7 @@ public sealed class FeedReader
         if (permalink is null) throw ApiProblem.Invalid("feed-item-link");
         var guidNode = item.Element(core + (nativeAtom ? "id" : "guid"));
         var guid = guidNode?.Value ?? permalink;
+        if (guid.Length is 0 or > 4096) throw ApiProblem.Invalid("feed-guid-limit");
         var identity = new EntryIdentity("feed-guid", guid, documentUrl.AbsoluteUri, guid, nativeAtom ? "false" : (string?)guidNode?.Attribute("isPermaLink"));
         var types = item.Elements(SemanticProfile.Atom + "category")
             .Select(c => (string?)c.Attribute("term"))
@@ -69,18 +73,26 @@ public sealed class FeedReader
             .Where(s => s is not null).Distinct().ToList();
         if (hints.Count > 1 || hints.Count == 1 && target is not null && UrlPolicy.Key(hints[0]!) != UrlPolicy.Key(target))
             status = "ambiguous";
+        if (hints.Count > 0 && types.Count > 0 && kind != "reply") status = "ambiguous";
         if (types.Count == 0 && hints.Count == 1) { kind = "reply"; target = hints[0]; status = "supported"; }
         var markdown = item.Elements().FirstOrDefault(e => SemanticProfile.SourceAliases.Contains(e.Name.NamespaceName)
             && e.Name.LocalName == "markdown")?.Value;
         var html = item.Element(core + (nativeAtom ? "content" : "description"))?.Value
             ?? item.Element(core + "summary")?.Value ?? "";
+        var htmlRelation = SemanticProfile.HtmlRelation(html, permalink, baseUrl);
+        if (htmlRelation.Ambiguous || htmlRelation.Kind is not null && (types.Count > 0 || hints.Count > 0)
+            && (kind != htmlRelation.Kind || target is not null && UrlPolicy.Key(target) != UrlPolicy.Key(htmlRelation.Target!)))
+            status = "ambiguous";
+        if (types.Count == 0 && hints.Count == 0 && status != "ambiguous" && htmlRelation.Kind is not null)
+        { kind = htmlRelation.Kind; target = htmlRelation.Target; status = "supported"; }
         var comments = item.Elements().FirstOrDefault(e => SemanticProfile.SourceAliases.Contains(e.Name.NamespaceName)
             && e.Name.LocalName == "comments");
         var source = item.Element("source");
         return new RemoteEntry(identity, permalink, kind, type, status, authors.SingleOrDefaultSafe(),
             Resolve((string?)source?.Attribute("url")), Date(item.Element(core + (nativeAtom ? "published" : "pubDate"))?.Value),
             Date(item.Element(SemanticProfile.Atom + "updated")?.Value), item.Element(core + "title")?.Value,
-            SemanticProfile.Sanitize(html), markdown, target, Resolve((string?)comments?.Attribute("feedUrl")));
+            SemanticProfile.Sanitize(html, baseUrl), markdown, target, Resolve((string?)comments?.Attribute("feedUrl")),
+            (string?)item.Attribute(SemanticProfile.Provenance + "authority") != "unverified-restore");
     }
 
     private static DateTime? Date(string? text) => DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture,

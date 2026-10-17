@@ -15,6 +15,10 @@ public sealed class ProblemHandler(IProblemDetailsService problems, ILogger<Prob
     public async ValueTask<bool> TryHandleAsync(HttpContext context, Exception exception, CancellationToken token)
     {
         var known = exception as ApiProblem;
+        if (exception is Microsoft.EntityFrameworkCore.DbUpdateConcurrencyException)
+            known = new ApiProblem(412, "revision-stale", "The resource changed concurrently.");
+        if (exception is BadHttpRequestException requestError)
+            known = new ApiProblem(requestError.StatusCode, "invalid-request", "The request could not be read.");
         var status = known?.Status ?? 500;
         if (known is null)
             logger.LogError("Request failed with exception type {ExceptionType}; trace {TraceId}.",

@@ -126,16 +126,17 @@ public sealed class PostService(AppDbContext db, InstanceOptions options, IRemot
         {
             var target = await db.Posts.SingleOrDefaultAsync(p => p.Id == localId, ct)
                 ?? throw ApiProblem.Invalid("local-target-missing");
-            CheckVisible(target);
             var reference = await db.References.SingleOrDefaultAsync(r => r.TargetId == localId && r.LocalSourceId == post.Id, ct);
             if (reference is null)
             {
+                CheckVisible(target);
                 await CheckReferenceCapacity(localId, ct);
                 reference = new InteractionReference { TargetId = localId, TargetUrl = post.TargetUrl, SourceUrl = post.Permalink,
                     SourceKey = UrlPolicy.Key(post.Permalink), LocalSourceId = post.Id, Kind = post.Kind, Status = "visible" };
                 db.References.Add(reference);
             }
             if (post.DeletedAt is not null || post.Hidden) reference.Status = "withdrawn";
+            else if (reference.Status == "withdrawn") reference.Status = "visible";
             reference.ObservedAt = now;
             ChangeJournal.Add(db, "interactions", localId.ToString(), post.Revision, "invalidate");
         }
@@ -149,6 +150,7 @@ public sealed class PostService(AppDbContext db, InstanceOptions options, IRemot
                 job = new MentionJob { Direction = "out", SourceId = post.Id, SourceUrl = post.Permalink, TargetUrl = post.TargetUrl };
                 db.Jobs.Add(job);
             }
+            else if (job.State is "accepted" or "unsupported" or "failed") await CheckJobCapacity(ct);
             job.SourceRevision = post.Revision;
             job.State = "pending";
             job.Attempt = 0;

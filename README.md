@@ -46,12 +46,19 @@ npm run build --workspace @feed-conversations/web
 npm exec playwright install chromium
 # With the process demo running:
 npm run test:browser
+dotnet test tests\FeedConversations.AcceptanceTests -c Release --no-build
 ```
 
-Current executed evidence: 22 unit checks, 7 integration checks, 5 frontend
-checks, and 2 real-browser checks pass, including a four-user A/B conversation,
-reverse-direction delivery, a public RSS-only walker, and empty browser storage.
+Current executed evidence: 44 unit checks, 25 integration checks, 9 frontend
+checks, 2 real-browser checks, and a separate .NET public RSS-only walker pass.
+These cover four-user A/B conversations, reverse-direction delivery, pinned
+retrieval/cache limits, protocol conflicts, durable SSE rechecks/revocation,
+restore conflicts, and empty browser storage. The independent walker consumes
+the synthetic chain produced by browser acceptance; run them in the shown order.
 This is partial acceptance evidence, not a claim that A01-A36 all pass.
+
+See [protocol details](docs/protocol.md) for the application-specific profile and
+the restored-copy authority boundary.
 
 ## Boundaries
 
@@ -64,6 +71,6 @@ This is partial acceptance evidence, not a claim that A01-A36 all pass.
 
 ## License
 
-A source license has not yet been selected. Publication of this plan does not
+A source license has not yet been selected. Publication of this source does not
 grant an open-source license. A license must be selected before an open-source
 software release.

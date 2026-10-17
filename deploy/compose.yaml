@@ -10,9 +10,11 @@ services:
       Instance__FrontendOrigin: https://app.example
       Instance__ProxyPath: /connections/a
       Instance__DataDirectory: /data
+      Instance__TrustedProxies__0: 172.29.0.10
     volumes:
       - a-data:/data
     restart: unless-stopped
+    networks: [backend]
   api-b:
     build:
       context: ..
@@ -24,18 +26,28 @@ services:
       Instance__FrontendOrigin: https://app.example
       Instance__ProxyPath: /connections/b
       Instance__DataDirectory: /data
+      Instance__TrustedProxies__0: 172.29.0.10
     volumes:
       - b-data:/data
     restart: unless-stopped
+    networks: [backend]
   edge:
-    image: caddy:2.11.2
+    image: caddy:2.11.7
     ports: ["443:443", "80:80"]
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ../src/web/dist:/srv/web:ro
       - edge-data:/data
     depends_on: [api-a, api-b]
+    networks:
+      backend:
+        ipv4_address: 172.29.0.10
 volumes:
   a-data:
   b-data:
   edge-data:
+networks:
+  backend:
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24

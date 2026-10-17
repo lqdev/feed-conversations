@@ -48,12 +48,14 @@ public sealed class RestoreService(AppDbContext db, InstanceOptions options, Cha
         var source = $"{archive.Manifest.SourceInstance}:{archive.Manifest.SourceAccount}";
         var mappings = await db.RestoredMappings.Where(m => m.OwnerId == owner.Id && m.SourceIdentity == source).ToListAsync(ct);
         var restored = new Dictionary<string, Post>();
+        var previousIdentity = new Dictionary<Guid, (string Kind, string? TargetKey, string? TargetUrl)>();
         foreach (var entry in archive.Posts)
         {
             var mapping = mappings.SingleOrDefault(m => m.OriginalGuid == entry.Guid);
             var hash = Wire.Hash(JsonSerializer.Serialize(entry, Wire.Json));
             var post = mapping is null ? new Post { OwnerId = owner.Id, Owner = owner, Guid = entry.Guid }
                 : await db.Posts.SingleAsync(p => p.Id == mapping.PostId, ct);
+            if (mapping is not null) previousIdentity[post.Id] = (post.Kind, post.TargetKey, post.TargetUrl);
             restored[entry.Permalink] = post;
             if (mapping?.ImportedHash == hash) continue;
             if (mapping is null) { post.Permalink = $"{options.BaseUrl}/post/{post.Id}"; db.Posts.Add(post); }
@@ -81,13 +83,17 @@ public sealed class RestoreService(AppDbContext db, InstanceOptions options, Cha
         foreach (var entry in archive.Posts)
         {
             var post = restored[entry.Permalink];
-            if (entry.Relationship is { } relation && restored.TryGetValue(relation.Target.Permalink, out var target))
+            if (entry.Relationship is { Target.Identity.Kind: "permalink" } relation
+                && restored.TryGetValue(relation.Target.Permalink, out var target))
             {
                 post.TargetUrl = target.Permalink;
                 post.TargetIdentityJson = JsonSerializer.Serialize(new TargetIdentity("permalink", target.Permalink), Wire.Json);
                 post.TargetKey = new EntryIdentity("permalink", target.Permalink).Key;
                 post.LocalTargetId = target.Id;
             }
+            if (previousIdentity.TryGetValue(post.Id, out var previous)
+                && (previous.Kind != post.Kind || previous.TargetKey != post.TargetKey || previous.TargetUrl != post.TargetUrl))
+                throw new ApiProblem(409, "restore-identity-conflict", "A later archive cannot change publication kind or target.");
         }
         var active = restored.Values.Where(p => p.DeletedAt is null && p.Kind is "like" or "bookmark").ToList();
         if (active.GroupBy(p => (p.Kind, p.TargetKey)).Any(g => g.Count() > 1)) throw new ApiProblem(409, "restore-association-conflict", "Duplicate active associations in archive.");
@@ -113,6 +119,16 @@ public sealed class RestoreService(AppDbContext db, InstanceOptions options, Cha
                     throw new ApiProblem(409, "reference-quota", "Restored references exceed quota.");
                 db.References.Add(new InteractionReference { TargetId = post.LocalTargetId!.Value, TargetUrl = post.TargetUrl, SourceUrl = post.Permalink,
                     SourceKey = UrlPolicy.Key(post.Permalink), LocalSourceId = post.Id, Kind = post.Kind, Status = "visible", ObservedAt = DateTime.UtcNow });
+            }
+        }
+        foreach (var post in restored.Values.Where(p => p.DeletedAt is not null || p.Hidden))
+        {
+            var references = await db.References.Where(r => r.LocalSourceId == post.Id).ToListAsync(ct);
+            foreach (var reference in references)
+            {
+                reference.Status = "withdrawn";
+                reference.ObservedAt = DateTime.UtcNow;
+                ChangeJournal.Add(db, "interactions", reference.TargetId.ToString(), post.Revision, "invalidate");
             }
         }
         owner.DisplayName = archive.Profile.DisplayName;

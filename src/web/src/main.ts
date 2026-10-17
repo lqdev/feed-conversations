@@ -1,6 +1,6 @@
 import DOMPurify from "dompurify";
 import { combineLatest, Subscription as RxSubscription } from "rxjs";
-import { ApiClient, ApiError, type Account, type Connection, type Post, type Relationship, type SavedView, type Snapshot, type ViewDefinition } from "./api/client";
+import { ApiClient, ApiError, type Account, type Connection, type CreatePostCommand, type Post, type Relationship, type ViewDefinition } from "./api/client";
 import { InstanceSession, localView } from "./sessions/InstanceSession";
 import { evaluate, localEntry, remoteEntries, type TimelineEntry } from "./views/evaluator";
 import "./styles.css";
@@ -110,7 +110,10 @@ async function workspace(connection: Connection, account: Account, connections: 
   const pages = new Map<string, HTMLElement>();
   function page(name: string): HTMLElement {
     const node = el("section"); node.hidden = pages.size !== 0; node.append(el("h2", name)); pages.set(name, node);
-    nav.append(button(name, () => { for (const [key, panel] of pages) panel.hidden = key !== name; }));
+    nav.append(button(name, () => {
+      for (const [key, panel] of pages) panel.hidden = key !== name;
+      active.viewObserved.next(name === "Timeline");
+    }));
     return node;
   }
   const timeline = page("Timeline"), subscriptions = page("Subscriptions"), views = page("Views"), thread = page("Thread"),
@@ -132,12 +135,15 @@ async function workspace(connection: Connection, account: Account, connections: 
     if (kind.value === "post") pendingRelationship = null;
   };
   submit(composer, "Publish publicly", async () => {
-    const relation = kind.value === "post" ? null : pendingRelationship?.kind === kind.value && pendingRelationship.target.permalink === target.value
-      ? pendingRelationship : { kind: kind.value, target: { permalink: target.value, identity: { kind: "permalink", value: target.value } } };
-    const result = await active.api.command<{ post: Post; delivery: { state: string } }>("/posts", {
+    const publicationKind = kind.value;
+    if (publicationKind !== "post" && publicationKind !== "reply" && publicationKind !== "like" && publicationKind !== "bookmark") throw new Error("Invalid publication kind.");
+    const relation: Relationship | null = publicationKind === "post" ? null : pendingRelationship?.kind === publicationKind && pendingRelationship.target.permalink === target.value
+      ? pendingRelationship : { kind: publicationKind, target: { permalink: target.value, identity: { kind: "permalink", value: target.value } } };
+    const command: CreatePostCommand = {
       title: kind.value === "like" || !title.value ? null : title.value,
       markdown: kind.value === "like" || !markdown.value ? null : markdown.value, relationship: relation,
-    }, "POST", undefined, pendingKey);
+    };
+    const result = await active.api.command<{ post: Post; delivery: { state: string } }>("/posts", command, "POST", undefined, pendingKey);
     pendingKey = crypto.randomUUID(); pendingRelationship = null; markdown.value = title.value = target.value = "";
     kind.value = "post"; title.disabled = markdown.disabled = false;
     status.textContent = `Published. Delivery: ${result.value.delivery.state}.`;
@@ -162,6 +168,7 @@ async function workspace(connection: Connection, account: Account, connections: 
         : { kind: "permalink", value: entry.permalink } } };
     pendingKey = crypto.randomUUID(); kind.onchange?.(new Event("change"));
     timeline.hidden = false; for (const [name, node] of pages) if (name !== "Timeline") node.hidden = true;
+    active.viewObserved.next(true);
     markdown.focus();
   }
   function renderEntry(entry: TimelineEntry): HTMLElement {
@@ -259,6 +266,7 @@ async function workspace(connection: Connection, account: Account, connections: 
   const threadOutput = el("div");
   async function showThread(url: string): Promise<void> {
     for (const [name, node] of pages) node.hidden = name !== "Thread";
+    active.viewObserved.next(false);
     threadUrl.value = url;
     const result = await active.api.get<{ complete: boolean; partialReasons: string[]; nodes: { permalink: string; kind: string; availability: string; parentIdentity: { value: string } | null }[] }>(`/thread?url=${encodeURIComponent(url)}`);
     threadOutput.replaceChildren(el("p", `Known-input completeness: ${result.value.complete}; ${result.value.partialReasons.join(", ")}`),
@@ -325,7 +333,10 @@ async function workspace(connection: Connection, account: Account, connections: 
     admin.append(accountForm);
   }
   uiSubscriptions.add(active.errors.subscribe(message => { alert.textContent = message; }));
-  uiSubscriptions.add(active.connectionState.subscribe(value => { status.textContent = `Connection: ${value}.`; }));
+  uiSubscriptions.add(active.connectionState.subscribe(value => {
+    if (value === "unauthenticated") { loginPage(connections); alert.textContent = "Session expired or access was revoked. Log in again."; }
+    else status.textContent = `Connection: ${value}.`;
+  }));
   await active.start();
 }
 function download(blob: Blob, name: string): void {

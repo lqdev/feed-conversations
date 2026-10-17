@@ -27,6 +27,7 @@ public sealed class ThreadAssembler(AppDbContext db, PostService posts, IRemoteF
         var path = new HashSet<string>();
         var reasons = new HashSet<string>();
         var remoteEntries = new Dictionary<string, RemoteEntry>();
+        var parentUrls = new Dictionary<string, string>();
         var fetches = 0;
         async Task<RemoteDocument?> Fetch(string location)
         {
@@ -52,7 +53,7 @@ public sealed class ThreadAssembler(AppDbContext db, PostService posts, IRemoteF
             var localId = posts.LocalId(location);
             if (localId is not null)
             {
-                var post = await db.Posts.Include(p => p.Owner).SingleOrDefaultAsync(p => p.Id == localId, ct);
+                var post = await db.Posts.Include(p => p.Owner).SingleOrDefaultAsync(p => p.Id == localId, deadline.Token);
                 if (post is null || post.Hidden)
                     node = new ThreadNode(new EntryIdentity("permalink", location), location, null, "unknown", null, null, "unavailable");
                 else
@@ -86,12 +87,18 @@ public sealed class ThreadAssembler(AppDbContext db, PostService posts, IRemoteF
                             catch (ApiProblem) { reasons.Add("ambiguous-identity"); }
                         }
                     }
+                    if (entry is null && feedUrl is null)
+                    {
+                        var relation = SemanticProfile.HtmlRelation(Encoding.UTF8.GetString(html.Bytes), location, html.FinalUrl);
+                        entry = new WebmentionProtocol().Extract(html, location, relation.Target ?? location).Entry;
+                        if (relation.Ambiguous && entry is not null) entry = entry with { SemanticStatus = "ambiguous" };
+                    }
                 }
                 if (entry is not null)
                 {
                     remoteEntries[key] = entry;
                     node = new ThreadNode(entry.Identity, location,
-                        entry.Kind == "reply" && entry.SemanticStatus == "supported" && entry.TargetUrl is not null ? new EntryIdentity("permalink", entry.TargetUrl) : null,
+                        entry.Kind == "reply" && entry.OriginAuthority && entry.SemanticStatus == "supported" && entry.TargetUrl is not null ? new EntryIdentity("permalink", entry.TargetUrl) : null,
                         entry.Kind, entry.AuthorUrl is null ? null : new { url = entry.AuthorUrl }, entry,
                         entry.SemanticStatus == "ambiguous" ? "ambiguous" : "fetched");
                     if (entry.SemanticStatus == "ambiguous") reasons.Add("ambiguous-identity");
@@ -105,8 +112,9 @@ public sealed class ThreadAssembler(AppDbContext db, PostService posts, IRemoteF
             nodes[key] = node;
             return node;
         }
-        async Task Expand(string location, int depth)
+        async Task Expand(string location, int depth, string? advertisedParent = null)
         {
+            if (deadline.IsCancellationRequested) { reasons.Add("deadline"); return; }
             var key = UrlPolicy.Key(location);
             if (!expanded.Add(key)) return;
             if (depth > 16) { reasons.Add("depth-budget"); return; }
@@ -114,54 +122,70 @@ public sealed class ThreadAssembler(AppDbContext db, PostService posts, IRemoteF
             var node = await Load(location);
             if (node is null) { path.Remove(key); return; }
             string? parentUrl = null;
-            if (node.Kind == "reply")
+            if (node.Kind == "reply" && node.ParentIdentity is not null)
             {
                 if (remoteEntries.TryGetValue(key, out var remote)) parentUrl = remote.TargetUrl;
                 else if (posts.LocalId(location) is { } local)
-                    parentUrl = await db.Posts.Where(p => p.Id == local).Select(p => p.TargetUrl).SingleOrDefaultAsync(ct);
+                    parentUrl = await db.Posts.Where(p => p.Id == local).Select(p => p.TargetUrl).SingleOrDefaultAsync(deadline.Token);
             }
-            if (parentUrl is not null && !expanded.Contains(UrlPolicy.Key(parentUrl))) await Expand(parentUrl, depth + 1);
-            var ownReplies = await db.Posts.Where(p => p.Kind == "reply" && p.TargetUrl != null && !p.Hidden && p.DeletedAt == null)
-                .Select(p => new { p.Permalink, p.TargetUrl }).Take(20001).ToListAsync(ct);
-            var childUrls = ownReplies.Where(p => UrlPolicy.Key(p.TargetUrl!) == key).Select(p => p.Permalink).ToHashSet();
+            if (parentUrl is not null)
+            {
+                var parentKey = UrlPolicy.Key(parentUrl);
+                parentUrls[key] = parentKey;
+                if (path.Contains(parentKey) && parentKey != advertisedParent) reasons.Add("cycle");
+                else if (!expanded.Contains(parentKey)) await Expand(parentUrl, depth + 1);
+            }
+            var childUrls = new HashSet<string>();
             if (posts.LocalId(location) is { } targetId)
             {
                 var approved = await db.References.Where(r => r.TargetId == targetId && r.Kind == "reply" && r.Status == "visible")
-                    .Select(r => r.SourceUrl).Take(200).ToListAsync(ct);
+                    .Select(r => r.SourceUrl).Take(200).ToListAsync(deadline.Token);
                 childUrls.UnionWith(approved);
             }
-            else if (remoteEntries.TryGetValue(key, out var origin) && origin.CommentsUrl is { } comments)
+            else
             {
-                var feed = await Fetch(comments);
-                if (feed is not null)
+                var targetKey = node.Identity.Key;
+                var permalinkKey = new EntryIdentity("permalink", location).Key;
+                var ownReplies = await db.Posts.Where(p => p.Kind == "reply" && !p.Hidden && p.DeletedAt == null
+                    && (p.TargetKey == targetKey || p.TargetKey == permalinkKey || p.TargetUrl == location))
+                    .Select(p => p.Permalink).Take(201).ToListAsync(deadline.Token);
+                childUrls.UnionWith(ownReplies);
+                if (remoteEntries.TryGetValue(key, out var origin) && origin.CommentsUrl is { } comments)
                 {
-                    try
+                    var feed = await Fetch(comments);
+                    if (feed is not null)
                     {
-                        foreach (var hint in reader.Parse(feed.Bytes, feed.FinalUrl))
+                        try
                         {
-                            var verified = await Load(hint.Permalink);
-                            if (verified is not null && remoteEntries.TryGetValue(UrlPolicy.Key(hint.Permalink), out var actual)
-                                && actual.Kind == "reply" && actual.SemanticStatus == "supported" && actual.TargetUrl is not null
-                                && UrlPolicy.Key(actual.TargetUrl) == key) childUrls.Add(actual.Permalink);
-                            else if (verified?.Availability != "local") reasons.Add("ambiguous-identity");
-                            else childUrls.Add(verified.Permalink);
+                            foreach (var hint in reader.Parse(feed.Bytes, feed.FinalUrl))
+                            {
+                                var verified = await Load(hint.Permalink);
+                                if (verified is not null && remoteEntries.TryGetValue(UrlPolicy.Key(hint.Permalink), out var actual)
+                                    && actual.OriginAuthority && actual.Kind == "reply" && actual.SemanticStatus == "supported" && actual.TargetUrl is not null
+                                    && UrlPolicy.Key(actual.TargetUrl) == key) childUrls.Add(actual.Permalink);
+                                else if (verified?.Availability == "local" && verified.Kind == "reply"
+                                    && verified.ParentIdentity is { Kind: "permalink" } parent && UrlPolicy.Key(parent.Value) == key)
+                                    childUrls.Add(verified.Permalink);
+                                else reasons.Add("ambiguous-identity");
+                            }
                         }
+                        catch (ApiProblem) { reasons.Add("ambiguous-identity"); }
                     }
-                    catch (ApiProblem) { reasons.Add("ambiguous-identity"); }
                 }
             }
             foreach (var child in childUrls)
             {
                 if (path.Contains(UrlPolicy.Key(child))) continue;
-                await Expand(child, depth + 1);
+                await Expand(child, depth + 1, key);
             }
             path.Remove(key);
         }
-        await Expand(url, 0);
+        try { await Expand(url, 0); }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested) { reasons.Add("deadline"); }
         var root = nodes.GetValueOrDefault(UrlPolicy.Key(url));
         var ancestors = new HashSet<string>();
-        while (root?.ParentIdentity is { Kind: "permalink" } parent
-            && nodes.TryGetValue(UrlPolicy.Key(parent.Value), out var next))
+        while (root is not null && parentUrls.TryGetValue(UrlPolicy.Key(root.Permalink), out var parent)
+            && nodes.TryGetValue(parent, out var next))
         {
             if (!ancestors.Add(root.Identity.Key)) { reasons.Add("cycle"); break; }
             root = next;

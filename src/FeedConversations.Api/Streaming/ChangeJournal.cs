@@ -20,6 +20,7 @@ public sealed class ChangeJournal(InstanceOptions options, IDataProtectionProvid
     private readonly IDataProtector protector = protection.CreateProtector("journal-cursor-v1");
     private readonly ConcurrentDictionary<Guid, (string Owner, Channel<bool> Signal)> observers = [];
     private readonly object gate = new();
+    public int ActiveObservers => observers.Count;
     public string Cursor(long sequence) => protector.Protect(JsonSerializer.Serialize(new StreamCursor(options.Id, incarnation, sequence), Wire.Json));
     public void Signal()
     {
@@ -83,7 +84,7 @@ public sealed class ChangeJournal(InstanceOptions options, IDataProtectionProvid
                 var low = await db.Changes.MinAsync(c => (long?)c.Sequence, token) ?? await HighWater(db, token) + 1;
                 if (sequence < Math.Max(0, low - 1))
                 {
-                    yield return new SseItem<object>(new { reason = "retention-expired" }, "reset-required");
+                    yield return new SseItem<object>(new { reason = "slow-consumer" }, "reset-required");
                     yield break;
                 }
                 var batch = await db.Changes.AsNoTracking().Where(c => c.Sequence > sequence)
@@ -103,8 +104,8 @@ public sealed class ChangeJournal(InstanceOptions options, IDataProtectionProvid
                     yield return new SseItem<object>(new { }, "heartbeat");
                     heartbeat = clock.GetUtcNow().AddSeconds(15);
                 }
-                using var wait = CancellationTokenSource.CreateLinkedTokenSource(token);
-                wait.CancelAfter(TimeSpan.FromSeconds(5));
+                using var recheck = new CancellationTokenSource(TimeSpan.FromSeconds(5), clock);
+                using var wait = CancellationTokenSource.CreateLinkedTokenSource(token, recheck.Token);
                 try { await channel.Reader.ReadAsync(wait.Token); }
                 catch (OperationCanceledException) when (!token.IsCancellationRequested) { }
             }

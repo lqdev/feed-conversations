@@ -60,6 +60,7 @@ public sealed class MentionWorker(IServiceScopeFactory scopes, IRemoteFetcher fe
         try
         {
             var document = await fetcher.GetAsync(claimed.Direction == "out" ? claimed.TargetUrl : claimed.SourceUrl, ct);
+            retryAfter = document.RetryAfter;
             if (claimed.Direction == "out")
             {
                 if (document.Status is >= 400)
@@ -95,9 +96,11 @@ public sealed class MentionWorker(IServiceScopeFactory scopes, IRemoteFetcher fe
                                     UrlPolicy.Key(item.TargetUrl) != UrlPolicy.Key(claimed.TargetUrl)
                                     || evidence.Status == "supported" && item.SemanticStatus == "supported" && evidence.Kind != item.Kind;
                                 if (disagrees) evidence = evidence with { Status = "ambiguous", Kind = "mention", Entry = null };
+                                else if (!item.OriginAuthority || item.SemanticStatus == "incomplete")
+                                    evidence = evidence with { Status = "incomplete", Kind = "mention", Entry = null };
                                 else if (item.SemanticStatus == "supported" && item.TargetUrl is not null)
                                     evidence = evidence with { Status = "supported", Kind = item.Kind, Entry = item,
-                                        AuthorUrl = item.AuthorUrl, AuthorFeedUrl = item.AuthorFeedUrl, CommentsUrl = item.CommentsUrl };
+                                        AuthorUrl = item.AuthorUrl, AuthorFeedUrl = item.AuthorFeedUrl ?? evidence.AuthorFeedUrl, CommentsUrl = item.CommentsUrl };
                             }
                         }
                     }

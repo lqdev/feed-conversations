@@ -6,6 +6,7 @@ using FeedConversations.Api.Networking;
 using FeedConversations.Api.Posts;
 using FeedConversations.Api.Streaming;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.AspNetCore.Http.Features;
 
 namespace FeedConversations.Api.Webmentions;
 
@@ -17,7 +18,11 @@ public static class WebmentionEndpoints
             TimeProvider clock, CancellationToken ct) =>
         {
             if (ctx.Request.ContentLength > 16384 || !ctx.Request.HasFormContentType) throw ApiProblem.Invalid("invalid-webmention-form");
-            var form = await ctx.Request.ReadFormAsync(ct);
+            var bodyLimit = ctx.Features.Get<IHttpMaxRequestBodySizeFeature>();
+            if (bodyLimit is { IsReadOnly: false }) bodyLimit.MaxRequestBodySize = 16384;
+            IFormCollection form;
+            try { form = await ctx.Request.ReadFormAsync(new FormOptions { ValueCountLimit = 2, KeyLengthLimit = 32, ValueLengthLimit = 4096 }, ct); }
+            catch (InvalidDataException) { throw ApiProblem.Invalid("invalid-webmention-form"); }
             if (form["source"].Count != 1 || form["target"].Count != 1) throw ApiProblem.Invalid("invalid-webmention-form");
             var source = UrlPolicy.Parse(form["source"].ToString()).AbsoluteUri;
             var target = UrlPolicy.Parse(form["target"].ToString()).AbsoluteUri;
@@ -32,6 +37,7 @@ public static class WebmentionEndpoints
                 job = new MentionJob { Direction = "in", SourceUrl = source, TargetUrl = target, TargetId = targetId };
                 db.Jobs.Add(job);
             }
+            else if (job.State is "accepted" or "unsupported" or "failed") await posts.CheckJobCapacity(ct);
             job.SourceRevision++;
             job.State = "pending";
             job.Attempt = 0;

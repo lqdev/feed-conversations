@@ -38,8 +38,9 @@ public static class PostEndpoints
             var owner = await AccountEndpoints.Current(ctx, db, ct);
             var (post, created) = await service.CreateAsync(owner, command, ctx.Request.Headers["Idempotency-Key"].ToString(), ct);
             ctx.Response.Headers.ETag = Wire.ETag("post", post.Id.ToString(), post.Revision);
-            var result = new { post = PostContracts.Dto(post), delivery = new { state = post.TargetUrl is null ? "not-required"
-                : post.LocalTargetId is not null ? "local" : "pending" }, created };
+            var delivery = post.TargetUrl is null ? "not-required" : post.LocalTargetId is not null ? "local"
+                : await db.Jobs.Where(j => j.SourceId == post.Id).Select(j => j.State).SingleOrDefaultAsync(ct) ?? "not-queued";
+            var result = new { post = PostContracts.Dto(post), delivery = new { state = delivery }, created };
             return created ? Results.Created($"/api/v1/posts/{post.Id}", result) : Results.Ok(result);
         }).RequireAuthorization();
         api.MapPatch("/posts/{id:guid}", async (Guid id, JsonElement patch, HttpContext ctx, AppDbContext db,

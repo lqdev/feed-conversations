@@ -2,6 +2,9 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using System.Xml.Linq;
+using FeedConversations.Api.Data;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace FeedConversations.IntegrationTests;
 
@@ -77,6 +80,61 @@ public sealed class PublicationTests
             }
         }
     }
+    [Fact]
+    public async Task DescendantCanStillEditAndWithdrawAfterParentWasDeleted()
+    {
+        await using var fixture = new ApiFixture();
+        var (client, _, _) = await fixture.LoginAsync();
+        using (client)
+        {
+            var (root, rootTag) = await Publish(client, new { title = (string?)null, markdown = "Root", relationship = (object?)null });
+            var target = root.GetProperty("permalink").GetString()!;
+            var (child, childTag) = await Publish(client, new { title = (string?)null, markdown = "Child",
+                relationship = new { kind = "reply", target = new { permalink = target, identity = new { kind = "permalink", value = target } } } });
+            using var removeRoot = new HttpRequestMessage(HttpMethod.Delete, "/api/v1/posts/" + root.GetProperty("id").GetString());
+            removeRoot.Headers.TryAddWithoutValidation("If-Match", rootTag);
+            Assert.Equal(HttpStatusCode.NoContent, (await client.SendAsync(removeRoot)).StatusCode);
+            var childPath = "/api/v1/posts/" + child.GetProperty("id").GetString();
+            using var edit = new HttpRequestMessage(HttpMethod.Patch, childPath) { Content = JsonContent.Create(new { markdown = "Still independent." }) };
+            edit.Headers.TryAddWithoutValidation("If-Match", childTag);
+            var edited = await client.SendAsync(edit);
+            Assert.Equal(HttpStatusCode.OK, edited.StatusCode);
+            using var removeChild = new HttpRequestMessage(HttpMethod.Delete, childPath);
+            removeChild.Headers.TryAddWithoutValidation("If-Match", edited.Headers.ETag!.Tag);
+            Assert.Equal(HttpStatusCode.NoContent, (await client.SendAsync(removeChild)).StatusCode);
+        }
+    }
+
+    [Fact]
+    public async Task RequeueOfTerminalJobMustReserveCapacityBeforeEditingPublication()
+    {
+        await using var fixture = new ApiFixture(remote: new FakeRemote());
+        var (client, _, _) = await fixture.LoginAsync();
+        using (client)
+        {
+            const string target = "https://controlled.example/unavailable";
+            var (post, tag) = await Publish(client, new { title = (string?)null, markdown = "Original",
+                relationship = new { kind = "reply", target = new { permalink = target, identity = new { kind = "permalink", value = target } } } });
+            using (var scope = fixture.Services.CreateScope())
+            {
+                var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+                (await db.Jobs.SingleAsync()).State = "accepted";
+                db.Jobs.AddRange(Enumerable.Range(0, 1000).Select(i => new MentionJob { Direction = "out",
+                    SourceUrl = $"https://a.example/synthetic/{i}", TargetUrl = target, DueAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow }));
+                await db.SaveChangesAsync();
+            }
+            using var edit = new HttpRequestMessage(HttpMethod.Patch, "/api/v1/posts/" + post.GetProperty("id").GetString())
+            { Content = JsonContent.Create(new { markdown = "Must roll back." }) };
+            edit.Headers.TryAddWithoutValidation("If-Match", tag);
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, (await client.SendAsync(edit)).StatusCode);
+            using var verify = fixture.Services.CreateScope();
+            var data = verify.ServiceProvider.GetRequiredService<AppDbContext>();
+            Assert.Equal("Original", (await data.Posts.SingleAsync()).Markdown);
+            Assert.Single(await data.Changes.ToListAsync());
+            Assert.Equal(1000, await data.Jobs.CountAsync(j => j.State == "pending"));
+        }
+    }
+
     [Fact]
     public async Task AnonymousApiIs401AndCsrfIsRequiredBeforeLogin()
     {
