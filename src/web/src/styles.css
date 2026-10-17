@@ -1,0 +1,19 @@
+:root { color-scheme: light dark; font: 16px/1.5 system-ui, sans-serif; }
+body { margin: 0; }
+main { max-width: 65rem; margin: auto; padding: 1.5rem; }
+header, nav, .actions { display: flex; flex-wrap: wrap; align-items: center; gap: .65rem; margin-bottom: 1rem; }
+form, article, section.panel { border: 1px solid #8886; border-radius: .5rem; padding: 1rem; margin-bottom: 1rem; }
+label { display: block; margin: .65rem 0; }
+input:not([type=checkbox]), textarea, select { box-sizing: border-box; padding: .5rem; max-width: 100%; }
+input:not([type=checkbox]), textarea { width: 100%; }
+textarea { min-height: 7rem; }
+button { padding: .5rem .8rem; cursor: pointer; }
+button:disabled { cursor: wait; }
+a { overflow-wrap: anywhere; }
+[role=alert] { color: #c94736; white-space: pre-wrap; }
+[role=status] { white-space: pre-wrap; }
+.meta { font-size: .85rem; opacity: .8; }
+.content { overflow-wrap: anywhere; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+:focus-visible { outline: 3px solid #4285f4; outline-offset: 3px; }
+[hidden] { display: none !important; }

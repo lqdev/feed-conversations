@@ -1,0 +1,4 @@
+[
+  {"id":"a","label":"Instance A","prefix":"/connections/a","publicOrigin":"https://localhost:7441"},
+  {"id":"b","label":"Instance B","prefix":"/connections/b","publicOrigin":"https://localhost:7442"}
+]

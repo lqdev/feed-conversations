@@ -1,0 +1,26 @@
+# Replace these synthetic domains and prepare private instance configuration.
+app.example {
+    handle_path /connections/a/* {
+        reverse_proxy api-a:8080 {
+            flush_interval -1
+        }
+    }
+    handle_path /connections/b/* {
+        reverse_proxy api-b:8080 {
+            flush_interval -1
+        }
+    }
+    root * /srv/web
+    header Cache-Control "no-store"
+    file_server
+}
+a.example {
+    reverse_proxy api-a:8080 {
+        flush_interval -1
+    }
+}
+b.example {
+    reverse_proxy api-b:8080 {
+        flush_interval -1
+    }
+}
