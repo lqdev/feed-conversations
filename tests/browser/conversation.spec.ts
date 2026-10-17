@@ -9,6 +9,10 @@ interface Credential { handle: string; password: string }
 const credentials = ["a", "b"].flatMap(instance =>
   (JSON.parse(readFileSync(resolve(`.runtime/${instance}/demo-credentials.json`), "utf8")) as Credential[])
     .map(credential => ({ ...credential, instance })));
+async function closeContext(context: BrowserContext): Promise<void> {
+  await Promise.all(context.pages().map(page => page.goto("about:blank", { waitUntil: "commit" })));
+  await context.close();
+}
 async function login(browser: Browser, handle: string): Promise<{ page: Page; context: BrowserContext }> {
   const credential = credentials.find(c => c.handle === handle)!;
   const context = await browser.newContext();
@@ -110,7 +114,7 @@ test("real four-user A/B read, publish, Webmention and public RSS-only traversal
       expect(await page.evaluate(() => ({ local: { ...localStorage }, session: { ...sessionStorage } }))).toEqual({ local: {}, session: {} });
     }
   } finally {
-    for (const context of sessions) await context.close();
+    for (const context of sessions) await closeContext(context);
   }
 });
 
@@ -120,7 +124,7 @@ test("B commands publish without remote reading", async ({ browser }) => {
     const target = await publish(page, `Standalone B note ${crypto.randomUUID()}`);
     await reply(page, target, `Standalone B reply ${crypto.randomUUID()}`);
     console.log("B local publication passed.");
-  } finally { await context.close(); }
+  } finally { await closeContext(context); }
 });
 
 test("public likes and bookmarks do not become replies; withdrawal recreates a new identity", async ({ browser }) => {
@@ -186,7 +190,7 @@ test("public likes and bookmarks do not become replies; withdrawal recreates a n
     expect(dates[0].updated).not.toBe(dates[1].updated);
     expect(afterEdit).toContain(edited);
   } finally {
-    for (const context of sessions) await context.close();
+    for (const context of sessions) await closeContext(context);
   }
 });
 
@@ -228,6 +232,6 @@ test("Carol edit revalidates on A and withdrawal leaves David's descendant reach
     await expect(david.page.locator("article").filter({ hasText: "reply: tombstone" })).toBeVisible();
     await expect(david.page.locator("article:visible").filter({ hasText: childText })).toBeVisible();
   } finally {
-    for (const context of sessions) await context.close();
+    for (const context of sessions) await closeContext(context);
   }
 });
