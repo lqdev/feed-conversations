@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/FeedConversations.Api/FeedConversations.Api.csproj" />
+    <Project Path="src/FeedConversations.AppHost/FeedConversations.AppHost.csproj" />
+    <Project Path="src/FeedConversations.ServiceDefaults/FeedConversations.ServiceDefaults.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/FeedConversations.AcceptanceTests/FeedConversations.AcceptanceTests.csproj" />
+    <Project Path="tests/FeedConversations.IntegrationTests/FeedConversations.IntegrationTests.csproj" />
+    <Project Path="tests/FeedConversations.UnitTests/FeedConversations.UnitTests.csproj" />
+  </Folder>
+</Solution>

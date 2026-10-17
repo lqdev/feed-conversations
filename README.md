@@ -1,18 +1,57 @@
 # feed-conversations
 
-A planned multi-user, feeds-native publishing and conversation application.
+A multi-user, feeds-native publishing and conversation application.
 
-**Status: design and implementation plan only. No application has been implemented.**
+**Status: MVP implementation in progress; not release-ready.** The real two-instance
+publishing/reading/Webmention loop runs. The complete acceptance matrix and
+operational/recovery gates in the implementation plan are not yet satisfied.
 
-The proposed MVP uses .NET 10 ASP.NET Core Minimal APIs, SQLite, an independent
+The application uses .NET 10 ASP.NET Core Minimal APIs, SQLite, an independent
 TypeScript/RxJS browser client, and Aspire for local two-instance development.
-It will publish public notes, replies, likes, and bookmarks, and read RSS/Atom
+It publishes public notes, replies, likes, and bookmarks, and reads RSS/Atom
 feeds without permanently archiving other publishers' content.
 
-See [the implementation plan](docs/implementation-plan.md) for the proposed
-architecture, wire contracts, delivery milestones, limits, and acceptance cases.
-Commands in that document are implementation targets, not runnable software
-provided by this repository.
+See [the implementation plan](docs/implementation-plan.md) for the complete
+requirements, wire contracts, delivery milestones, limits, and acceptance cases.
+Passing a build or the first conversation loop is not full-MVP completion.
+
+## Local development
+
+Requires .NET SDK 10.0.402, Node 22.23.2, npm, and PowerShell 7.
+No Docker is required for the process demo.
+
+```powershell
+dotnet tool restore
+dotnet restore FeedConversations.slnx --locked-mode
+dotnet build FeedConversations.slnx -c Release --no-restore
+npm ci
+.\scripts\Initialize-Dev.ps1
+.\scripts\Start-Demo.ps1
+```
+
+The frontend is `https://localhost:7440`, A is `:7441`, and B is `:7442`.
+The initializer generates synthetic demo credentials privately under `.runtime`
+and separate databases/keys for both instances. Do not publish that directory.
+For an interactive browser, trust your development certificate explicitly with
+`dotnet dev-certs https --trust`. Controlled browser tests instead pin only its
+public key; safe A/B transport trusts only that certificate at exact configured
+Development origins. Production refuses these exceptions.
+
+```powershell
+dotnet test tests\FeedConversations.UnitTests -c Release --no-build
+dotnet test tests\FeedConversations.IntegrationTests -c Release --no-build
+npm run typecheck --workspace @feed-conversations/web
+npm run test --workspace @feed-conversations/web -- --run
+npm run build --workspace @feed-conversations/web
+npm exec playwright install chromium
+# With the process demo running:
+npm run test:browser
+```
+
+Current executed evidence: 22 unit checks, 7 integration checks, 5 frontend
+checks, and 2 real-browser checks pass, including a four-user A/B conversation,
+reverse-direction delivery, a public RSS-only walker, and empty browser storage.
+This is partial acceptance evidence, not a claim that A01-A36 all pass.
 
 ## Boundaries
 

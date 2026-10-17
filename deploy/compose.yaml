@@ -1,0 +1,41 @@
+services:
+  api-a:
+    build:
+      context: ..
+      dockerfile: src/FeedConversations.Api/Dockerfile
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      Instance__Id: production-a
+      Instance__PublicBaseUrl: https://a.example
+      Instance__FrontendOrigin: https://app.example
+      Instance__ProxyPath: /connections/a
+      Instance__DataDirectory: /data
+    volumes:
+      - a-data:/data
+    restart: unless-stopped
+  api-b:
+    build:
+      context: ..
+      dockerfile: src/FeedConversations.Api/Dockerfile
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      Instance__Id: production-b
+      Instance__PublicBaseUrl: https://b.example
+      Instance__FrontendOrigin: https://app.example
+      Instance__ProxyPath: /connections/b
+      Instance__DataDirectory: /data
+    volumes:
+      - b-data:/data
+    restart: unless-stopped
+  edge:
+    image: caddy:2.11.2
+    ports: ["443:443", "80:80"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ../src/web/dist:/srv/web:ro
+      - edge-data:/data
+    depends_on: [api-a, api-b]
+volumes:
+  a-data:
+  b-data:
+  edge-data:

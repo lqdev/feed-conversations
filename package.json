@@ -1,0 +1,12 @@
+{
+  "name": "feed-conversations",
+  "private": true,
+  "workspaces": ["src/web"],
+  "scripts": {
+    "test:browser": "playwright test --config tests/browser/playwright.config.ts"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1"
+  },
+  "engines": { "node": ">=22.23.2 <23" }
+}

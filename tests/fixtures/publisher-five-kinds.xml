@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:source="http://source.scripting.com/">
+  <channel><title>Synthetic publisher</title><link>https://publisher.example/</link><description>Independent input fixture</description>
+    <item><guid isPermaLink="false">opaque:article</guid><link>https://publisher.example/article</link><title>A blog article</title><atom:category term="https://schema.org/BlogPosting"/><atom:link rel="https://schema.org/author" href="https://publisher.example/about"/><description>Article sentinel.</description><source:markdown>Article sentinel.</source:markdown></item>
+    <item><guid isPermaLink="false">opaque:note</guid><link>https://publisher.example/note</link><atom:category term="https://schema.org/SocialMediaPosting"/><atom:link rel="https://schema.org/author" href="https://publisher.example/about"/><description>A short note.</description></item>
+    <item><guid isPermaLink="false">opaque:reply</guid><link>https://publisher.example/reply</link><atom:category term="https://schema.org/Comment"/><atom:link rel="https://schema.org/author" href="https://publisher.example/about"/><atom:link rel="https://schema.org/parentItem" href="https://a.example/post/root"/><description>A response.</description></item>
+    <item><guid isPermaLink="false">opaque:like</guid><link>https://publisher.example/like</link><atom:category term="https://schema.org/LikeAction"/><atom:link rel="https://schema.org/agent" href="https://publisher.example/about"/><atom:link rel="https://schema.org/object" href="https://a.example/post/root"/><description>Liked this page.</description></item>
+    <item><guid isPermaLink="false">opaque:bookmark</guid><link>https://publisher.example/bookmark</link><atom:category term="https://schema.org/BookmarkAction"/><atom:link rel="https://schema.org/agent" href="https://publisher.example/about"/><atom:link rel="https://schema.org/object" href="https://a.example/post/root"/><description>Bookmarked this page.</description></item>
+  </channel>
+</rss>
